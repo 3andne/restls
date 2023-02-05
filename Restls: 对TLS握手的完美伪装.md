@@ -59,11 +59,11 @@ ShadowTLS协议握手过程并未提供服务端的认证，只能认定服务�
 
 为了解决ShadowTLS上述的问题（无法提供双向认证），我们设计了Restls协议，意为Restless，希望该协议可以让防火墙设计者们坐立不安。本协议兼容主流的TLS1.2和TLS1.3，可以将服务器伪装成任何一个白名单内网站，在TLS握手的同时，秘密进行客户端和服务端的双向认证，认证过程完全不引入新的特征，实现对TLS握手的完美伪装*。
 
-restls server: https://github.com/3andne/restls
-restls client (a fork of clash.meta): https://github.com/3andne/Clash.Meta
-restls tls library: https://github.com/3andne/restls-client-go
+restls server: https://github.com/3andne/restls  
+restls client (a fork of clash.meta): https://github.com/3andne/Clash.Meta  
+restls tls library (client-side): https://github.com/3andne/restls-client-go  
 
-*: Restls（以及ShadowTLS）仅实现了对握手流程的完美伪装，但暂未关注诸如ClientHello指纹等问题。
+*: Restls（以及ShadowTLS）仅关注对握手流程的完美伪装，暂未关注诸如ClientHello指纹等问题，这会是我们下一步的工作。
 
 ### Overview
 

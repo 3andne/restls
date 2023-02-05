@@ -63,11 +63,11 @@ According to @CoiaPrant233's ideas, firewalls can detect ShadowTLS as follows:
 
 To address the issue of ShadowTLS not providing two-way authentication, we have designed the Restls protocol, which stands for restless, with the hope that it will keep GFW designers restless. This protocol is compatible with TLS1.2 and TLS1.3 and can disguise the server as any website in the whitelist. During the TLS handshake, it secretly performs two-way authentication between the client and server. The authentication process introduces no new characteristics and achieves a perfect impersonation of the TLS handshake.*
 
-restls server: https://github.com/3andne/restls
-restls client (a fork of clash.meta): https://github.com/3andne/Clash.Meta
-restls tls library: https://github.com/3andne/restls-client-go
+restls server: https://github.com/3andne/restls  
+restls client (a fork of clash.meta): https://github.com/3andne/Clash.Meta  
+restls tls library (client-side): https://github.com/3andne/restls-client-go  
 
-*Restls (as well as ShadowTLS) only targets the handshake process, and has not yet addressed issues such as the ClientHello fingerprinting.
+*Restls (as well as ShadowTLS) only targets the handshake process, and has not yet addressed issues such as the ClientHello fingerprinting. We'll work on that later.
 
 ### Overview
 

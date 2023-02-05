@@ -18,3 +18,27 @@ USAGE:
 ```
 
 Currently only TLS 1.3 is implemented. TLS 1.2 remains a work in progress.
+
+To deploy a Restls Service:
+1. Start the shadowsocks server:
+    ```
+    ss-server -p 8888 -k [YOUR_SS_PASSWORD]
+    ```
+2. Start the Restls server:
+   ```
+   restls -s "www.microsoft.com" -l "0.0.0.0:443" -p [YOUR_RESTLS_PASSWORD] -f "127.0.0.1:8888"
+   ```
+3. Define a restls proxy in [Clash.Meta Restls fork](https://github.com/3andne/Clash.Meta#restls)
+   ```
+   - name: restls
+     type: ss
+     server: [YOUR_SERVER_IP]
+     port: 443
+     cipher: chacha20-ietf-poly1305
+     password: [YOUR_SS_PASSWORD]
+     plugin: restls
+     plugin-opts:
+         host: "www.microsoft.com" # Must be a TLS 1.3 server
+         password: [YOUR_RESTLS_PASSWORD]
+         version-hint: "tls13"
+   ```
