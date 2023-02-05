@@ -1,4 +1,4 @@
-use sha1::{Digest, Sha1};
+use sha1::Digest;
 use structopt::StructOpt;
 
 fn parse_log_level(l: &str) -> tracing::Level {
@@ -29,7 +29,7 @@ impl Password {
 }
 
 fn make_password(h: &str) -> Password {
-    let mut hasher = Sha1::new();
+    let mut hasher = sha2::Sha512::new();
     hasher.update(h.as_bytes());
     let res = hasher.finalize();
     let mut res_vec = Vec::new();
@@ -47,7 +47,7 @@ pub struct Opt {
     pub log_level: tracing::Level,
 
     /// Server Name Indication (sni), or Hostname.
-    #[structopt(short = "h", long, parse(from_str = parse_hostname))]
+    #[structopt(short = "s", long, parse(from_str = parse_hostname))]
     pub server_hostname: String,
 
     /// server proxy port
@@ -59,7 +59,7 @@ pub struct Opt {
     pub forward_to: String,
 
     /// the password to authenticate connections
-    #[structopt(short = "w", long, parse(from_str = make_password))]
+    #[structopt(short = "p", long, parse(from_str = make_password))]
     pub password: Password,
 }
 

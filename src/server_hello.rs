@@ -13,7 +13,7 @@ use crate::{
 pub(crate) struct ServerHello {
     pub(crate) is_tls_13: bool,
     pub(crate) server_random: [u8; 32],
-    pub(crate) key_share: Vec<u8>,
+    pub(crate) _key_share: Vec<u8>,
 }
 
 impl ServerHello {
@@ -73,7 +73,7 @@ impl ServerHello {
         Ok(ServerHello {
             is_tls_13,
             server_random,
-            key_share,
+            _key_share: key_share,
         })
     }
 }

@@ -26,11 +26,11 @@ impl SessionID {
 }
 
 pub(crate) struct ClientHello {
-    pub(crate) client_random: [u8; 32],
+    pub(crate) _client_random: [u8; 32],
     pub(crate) session_id: SessionID,
     pub(crate) key_share: Vec<u8>,
     pub(crate) psk: Vec<u8>,
-    pub(crate) session_ticket: Vec<u8>,
+    pub(crate) _session_ticket: Vec<u8>,
 }
 
 impl ClientHello {
@@ -81,7 +81,7 @@ impl ClientHello {
         debug!("parsing client hello: {}", buf.remaining());
 
         buf.advance(5); // record header
-        let mut client_random = [0; 32];
+        let mut _client_random = [0; 32];
         let htype = buf.get_u8();
         if htype != HANDSHAKE_TYPE_CLIENT_HELLO {
             return Err(anyhow!(
@@ -92,7 +92,7 @@ impl ClientHello {
         }
         buf.advance(3); // len
         buf.advance(2); // version
-        buf.copy_to_slice(&mut client_random); // client random
+        buf.copy_to_slice(&mut _client_random); // client random
         let mut session_id = SessionID {
             session_id: [0; 40],
             len: 0,
@@ -137,11 +137,11 @@ impl ClientHello {
             return Err(anyhow!("reject: client must support tls 1.3"));
         }
         Ok(ClientHello {
-            client_random,
+            _client_random,
             session_id,
             key_share,
             psk,
-            session_ticket,
+            _session_ticket: session_ticket,
         })
     }
 }

@@ -171,7 +171,7 @@ impl TryHandshake {
         let mut hasher =
             HmacSha1::new_from_slice(restls_password).expect("sha1 should take key of any size");
         hasher.update(&server_hello.server_random);
-        hasher.update(&server_hello.key_share);
+        hasher.update(&server_hello.server_random);
         let res = hasher.finalize().into_bytes();
         let expect = &res[..REQUIRED_HMAC_LEN];
         let application_data = &in_buf[5..];
@@ -269,6 +269,13 @@ pub async fn handle(options: Arc<Opt>, inbound: TcpStream) -> Result<()> {
 
 pub async fn start(options: Arc<Opt>) -> Result<()> {
     let listener = TcpListener::bind(&options.listen).await?;
+
+    tracing::info!(
+        "Restls server started as {} on {}, forwarding to {}",
+        options.server_hostname,
+        options.listen,
+        options.forward_to,
+    );
     loop {
         let (stream, _) = listener
             .accept()

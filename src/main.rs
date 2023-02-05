@@ -23,6 +23,8 @@ async fn main() -> Result<()> {
         .finish();
     let _ = tracing::subscriber::set_global_default(collector);
 
-    let _ = restls::start(Arc::new(options)).await;
+    if let Err(e) = restls::start(Arc::new(options)).await {
+        tracing::error!("failed to start Restls server: {:?}", e);
+    }
     Ok(())
 }
