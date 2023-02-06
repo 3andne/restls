@@ -11,34 +11,69 @@ use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
 
-use crate::common::RECORD_DUMMY;
-
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
 
 pub struct TLSCodec {
-    pub buf: Vec<u8>,
-    pub need_header: bool,
+    buf: Vec<u8>,
+    cursor: usize,
     pub enable_codec: bool,
 }
 
 impl TLSCodec {
     pub fn new() -> Self {
         Self {
-            need_header: true,
             buf: Vec::with_capacity(0x2000),
             enable_codec: true,
+            cursor: 0,
         }
     }
 
     pub fn reset(&mut self) {
+        assert!(self.cursor == self.buf.len());
         unsafe {
             self.buf.set_len(0);
+            self.cursor = 0;
         }
+    }
+
+    fn peek_record_length(&self) -> usize {
+        5 + ((self.buf[self.cursor + 3] as usize) << 8 | self.buf[self.cursor + 4] as usize)
+    }
+
+    pub fn next_record(&mut self) -> &mut [u8] {
+        let start = self.cursor;
+        self.cursor += self.peek_record_length();
+        &mut self.buf[start..self.cursor]
+    }
+
+    pub fn peek_record(&self) -> &[u8] {
+        let len = self.peek_record_length();
+        &self.buf[self.cursor..self.cursor + len]
+    }
+    pub fn peek_record_type(&self) -> u8 {
+        self.buf[self.cursor]
+    }
+
+    pub fn has_next(&self) -> bool {
+        self.cursor < self.buf.len()
+    }
+
+    pub fn skip_to_end(&mut self) {
+        self.cursor = self.buf.len();
+    }
+
+    pub fn raw_buf(&self) -> &[u8] {
+        assert!(self.cursor == self.buf.len());
+        &self.buf
+    }
+
+    pub fn has_content(&self) -> bool {
+        !self.buf.is_empty()
     }
 }
 
 impl Decoder for TLSCodec {
-    type Item = u8;
+    type Item = ();
 
     type Error = anyhow::Error;
 
@@ -46,44 +81,43 @@ impl Decoder for TLSCodec {
         &mut self,
         src: &mut bytes::BytesMut,
     ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        self.reset();
+
         if !self.enable_codec {
             if src.len() == 0 {
                 return Ok(None);
             }
-            self.reset();
             self.buf.extend_from_slice(&src);
             src.advance(src.len());
-            return Ok(Some(RECORD_DUMMY));
+            return Ok(Some(()));
         }
 
         if src.len() < 5 {
             debug!("src len < 5");
             return Ok(None);
         }
-        let rtype = src[0];
-        let len = ((src[3] as u16) << 8 | (src[4] as u16)) as usize;
-        debug!("incoming record len: {}", len);
-        if src.len() < 5 + len {
-            debug!("src.len() {} < 5 + len, {}", src.len(), 5 + len);
-            src.reserve(5 + len - src.len());
+        let mut cursor = 0;
+        while cursor + 5 < src.len() {
+            let record_len = ((src[cursor + 3] as u16) << 8 | (src[cursor + 4] as u16)) as usize;
+            debug!("incoming record len: {}", record_len);
+            if src.len() < cursor + 5 + record_len {
+                break;
+            }
+            cursor += 5 + record_len;
+        }
+        if cursor == 0 {
             return Ok(None);
         }
+        self.buf.reserve(cursor);
         unsafe {
-            self.buf.set_len(0);
-            let buf_len = if self.need_header { len + 5 } else { len };
-            self.buf.reserve(buf_len);
-            self.buf.set_len(buf_len);
-        }
-        if !self.need_header {
-            src.advance(5);
-            src.copy_to_slice(&mut self.buf);
-        } else {
-            src.copy_to_slice(&mut self.buf);
+            self.buf.set_len(cursor);
         }
 
-        tracing::debug!("decoded: {:?}", self.buf);
+        src.copy_to_slice(&mut self.buf);
 
-        Ok(Some(rtype))
+        tracing::debug!("decoded: {}", self.buf.len());
+
+        Ok(Some(()))
     }
 }
 
@@ -146,32 +180,39 @@ pub(crate) fn xor_bytes(secret: &[u8], msg: &mut [u8]) {
 pub async fn copy_bidirectional(
     mut inbound: TLSStream,
     mut outbound: TcpStream,
-    content_offset: usize,
+    mut content_offset: usize,
 ) -> Result<()> {
     let mut out_buf = [0; 0x2000];
     out_buf[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
-    inbound.codec_mut().need_header = false;
-    outbound
-        .write_all(&inbound.codec().buf[content_offset..])
-        .await?;
+    while inbound.codec().has_next() {
+        outbound
+            .write_all(&inbound.codec_mut().next_record()[content_offset..])
+            .await?;
+        content_offset = 5;
+    }
+
     inbound.codec_mut().reset();
 
     loop {
         select! {
-            n = inbound.next() => {
-                match n {
-                    Some(Ok(v)) if v != 0 => (),
+            res = inbound.next() => {
+                match res {
+                    Some(Ok(_)) => (),
                     e => {
-                        e.ok_or(anyhow!("relay inbound: "))??;
+                        e.ok_or(anyhow!("failed to read from inbound: "))??;
                     }
                 }
-                outbound.write_all(&inbound.codec().buf).await?;
+                while inbound.codec().has_next() {
+                    outbound
+                        .write_all(&inbound.codec_mut().next_record()[5..])
+                        .await?;
+                }
                 inbound.codec_mut().reset();
             }
             n = outbound.read(&mut out_buf[5..]) => {
                 let n = n?;
                 if n == 0 {
-                    return Err(anyhow!("relay outbound: "));
+                    return Err(anyhow!("failed to read from outbound: "));
                 }
                 out_buf[3..5].copy_from_slice(&(n as u16).to_be_bytes());
                 inbound.get_mut().write_all(&out_buf[..n+5]).await?;
@@ -186,39 +227,52 @@ pub async fn copy_bidirectional_fallback(
 ) -> Result<()> {
     inbound.codec_mut().enable_codec = false;
     outbound.codec_mut().enable_codec = false;
-    if inbound.codec().buf.len() > 0 {
-        debug!("write old msg to inbound {:?}", &inbound.codec().buf);
-        outbound.get_mut().write_all(&inbound.codec().buf).await?;
+    if inbound.codec().has_content() {
+        inbound.codec_mut().skip_to_end();
+        debug!(
+            "write old msg to inbound {}",
+            inbound.codec().raw_buf().len()
+        );
+        outbound
+            .get_mut()
+            .write_all(inbound.codec().raw_buf())
+            .await?;
     }
-    if outbound.codec().buf.len() > 0 {
-        debug!("write old msg to outbound {:?}", &outbound.codec().buf);
-        inbound.get_mut().write_all(&outbound.codec().buf).await?;
+    if outbound.codec().has_content() {
+        outbound.codec_mut().skip_to_end();
+        debug!(
+            "write old msg to outbound {}",
+            outbound.codec().raw_buf().len()
+        );
+        inbound
+            .get_mut()
+            .write_all(outbound.codec().raw_buf())
+            .await?;
     }
 
     debug!("start relaying");
 
     loop {
         select! {
-            n = inbound.next() => {
-                match n {
-                    Some(Ok(v)) if v != 0 => (),
+            res = inbound.next() => {
+                match res {
+                    Some(Ok(_)) => (),
                     e => {
-                        e.ok_or(anyhow!("relay inbound: "))??;
+                        e.ok_or(anyhow!("failed to read from inbound: "))??;
                     }
                 }
-                debug!("writing to outbound: {}", inbound.codec().buf.len());
-                outbound.get_mut().write_all(&inbound.codec().buf).await?;
+                inbound.codec_mut().skip_to_end();
+                outbound.get_mut().write_all(inbound.codec().raw_buf()).await?;
             }
-            n = outbound.next() => {
-                match n {
-                    Some(Ok(v)) if v != 0 => (),
+            res = outbound.next() => {
+                match res {
+                    Some(Ok(_))  => (),
                     e => {
-                        e.ok_or(anyhow!("relay inbound: "))??;
+                        e.ok_or(anyhow!("failed to read from outbound: "))??;
                     }
                 }
-                debug!("writing to inbound: {}", outbound.codec().buf.len());
-
-                inbound.get_mut().write_all(&outbound.codec().buf).await?;
+                outbound.codec_mut().skip_to_end();
+                inbound.get_mut().write_all(outbound.codec().raw_buf()).await?;
             }
         }
     }

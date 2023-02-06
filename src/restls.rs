@@ -23,40 +23,47 @@ use crate::{
 struct TryHandshake {}
 
 impl TryHandshake {
-    async fn read_from_stream(&self, stream: &mut TLSStream) -> Result<u8> {
-        stream
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("unexpected eof"))?
+    async fn read_from_stream(&self, stream: &mut TLSStream) -> Result<()> {
+        if stream.codec().has_next() {
+            Ok(())
+        } else {
+            stream
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("unexpected eof"))?
+        }
     }
 
     async fn try_read_client_hello(&self, inbound: &mut TLSStream) -> Result<ClientHello> {
-        let rtype = self
-            .read_from_stream(inbound)
+        self.read_from_stream(inbound)
             .await
             .context("failed to read client hello: ")?;
+
+        let rtype = inbound.codec().peek_record_type();
         if rtype != RECORD_HANDSHAKE {
             return Err(anyhow!(
                 "reject: incorrect record type for client hello, actual: {}",
                 rtype
             ));
         }
-        let mut cursor = Cursor::new(inbound.codec().buf.as_slice());
+        let record = inbound.codec_mut().next_record();
+        let mut cursor = Cursor::new(&*record);
         ClientHello::parse(&mut cursor).context("unable to parse client hello: ")
     }
 
     async fn try_read_server_hello(&mut self, outbound: &mut TLSStream) -> Result<ServerHello> {
-        let rtype = self
-            .read_from_stream(outbound)
+        self.read_from_stream(outbound)
             .await
             .context("failed to read server hello: ")?;
+        let rtype = outbound.codec().peek_record_type();
         if rtype != RECORD_HANDSHAKE {
             return Err(anyhow!(
                 "reject: incorrect record type for client hello, actual: {}",
                 rtype
             ));
         }
-        let mut cursor = Cursor::new(outbound.codec().buf.as_slice());
+        let record = outbound.codec_mut().next_record();
+        let mut cursor = Cursor::new(&*record);
         ServerHello::parse(&mut cursor).context("unable to parse client hello: ")
     }
 
@@ -69,7 +76,8 @@ impl TryHandshake {
     ) -> Result<()> {
         let mut ccs_from_server = false;
         loop {
-            let rtype = self.read_from_stream(outbound).await?;
+            self.read_from_stream(outbound).await?;
+            let rtype = outbound.codec().peek_record_type();
 
             match rtype {
                 RECORD_CCS if !ccs_from_server => {
@@ -84,6 +92,7 @@ impl TryHandshake {
                 ))
                 }
             }
+            outbound.codec_mut().next_record();
             self.relay_to(inbound, outbound).await?;
         }
         let mut hasher =
@@ -91,10 +100,8 @@ impl TryHandshake {
         hasher.update(&server_hello.server_random);
         let secret = hasher.finalize().into_bytes();
         debug!("tls13 server challenge {:?}", &secret[..REQUIRED_HMAC_LEN]);
-        xor_bytes(
-            &secret[..REQUIRED_HMAC_LEN],
-            &mut outbound.codec_mut().buf[5..],
-        );
+        let record = outbound.codec_mut().next_record();
+        xor_bytes(&secret[..REQUIRED_HMAC_LEN], &mut record[5..]);
         Ok(())
     }
 
@@ -108,9 +115,9 @@ impl TryHandshake {
         let mut ccs_from_client = false;
         loop {
             select! {
-                rtype = self.read_from_stream(inbound) => {
-                    let rtype = rtype?;
-                    match rtype {
+                res = self.read_from_stream(inbound) => {
+                    let _ = res?;
+                    match inbound.codec().peek_record_type() {
                         RECORD_CCS if !ccs_from_client => {
                             ccs_from_client = true;
                         }
@@ -120,15 +127,18 @@ impl TryHandshake {
                                 break;
                             }
                         }
-                        _ => {
+                        rtype => {
                             return Err(anyhow!(
                                 "reject: incorrect record type, expected 1 CCS or Application Data, actual {rtype}",
                             ));
                         }
                     }
+                    inbound.codec_mut().next_record();
                     self.relay_to(outbound, inbound).await?;
                 }
-                _ = self.read_from_stream(outbound) => {
+                res = self.read_from_stream(outbound) => {
+                    let _ = res?;
+                    outbound.codec_mut().skip_to_end();
                     self.relay_to(inbound, outbound).await?;
                 }
             }
@@ -198,9 +208,12 @@ impl TryHandshake {
         to_stream: &mut TLSStream,
         from_stream: &mut TLSStream,
     ) -> Result<()> {
+        if from_stream.codec().has_next() {
+            return Ok(());
+        }
         let res = match to_stream
             .get_mut()
-            .write_all(&from_stream.codec().buf)
+            .write_all(&from_stream.codec().raw_buf())
             .await
         {
             Ok(()) => Ok(()),
@@ -231,7 +244,11 @@ impl TryHandshake {
             self.relay_to(inbound, outbound).await?;
             self.try_read_till_client_application_data(2, outbound, inbound)
                 .await?;
-            self.check_tls_13_application_data_auth(&server_hello, password, &inbound.codec().buf)?;
+            self.check_tls_13_application_data_auth(
+                &server_hello,
+                password,
+                inbound.codec().peek_record(),
+            )?;
             Ok(REQUIRED_HMAC_LEN + 5)
         } else {
             unimplemented!("TLS 1.2 remains a work in progress");
