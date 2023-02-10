@@ -27,10 +27,10 @@ impl TryHandshake {
         if stream.codec().has_next() {
             Ok(())
         } else {
-            stream
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("unexpected eof"))?
+            match stream.next().await {
+                None => Err(anyhow!("unexpected eof")),
+                Some(res) => res,
+            }
         }
     }
 
@@ -38,8 +38,7 @@ impl TryHandshake {
         self.read_from_stream(inbound)
             .await
             .context("failed to read client hello: ")?;
-
-        let rtype = inbound.codec().peek_record_type();
+        let rtype = inbound.codec().peek_record_type()?;
         if rtype != RECORD_HANDSHAKE {
             return Err(anyhow!(
                 "reject: incorrect record type for client hello, actual: {}",
@@ -55,10 +54,10 @@ impl TryHandshake {
         self.read_from_stream(outbound)
             .await
             .context("failed to read server hello: ")?;
-        let rtype = outbound.codec().peek_record_type();
+        let rtype = outbound.codec().peek_record_type()?;
         if rtype != RECORD_HANDSHAKE {
             return Err(anyhow!(
-                "reject: incorrect record type for client hello, actual: {}",
+                "reject: incorrect record type for server hello, actual: {}",
                 rtype
             ));
         }
@@ -77,7 +76,7 @@ impl TryHandshake {
         let mut ccs_from_server = false;
         loop {
             self.read_from_stream(outbound).await?;
-            let rtype = outbound.codec().peek_record_type();
+            let rtype = outbound.codec().peek_record_type()?;
 
             match rtype {
                 RECORD_CCS if !ccs_from_server => {
@@ -117,7 +116,7 @@ impl TryHandshake {
             select! {
                 res = self.read_from_stream(inbound) => {
                     let _ = res?;
-                    match inbound.codec().peek_record_type() {
+                    match inbound.codec().peek_record_type()? {
                         RECORD_CCS if !ccs_from_client => {
                             ccs_from_client = true;
                         }
@@ -258,15 +257,13 @@ impl TryHandshake {
 }
 
 pub async fn handle(options: Arc<Opt>, inbound: TcpStream) -> Result<()> {
-    let codec_in = TLSCodec::new();
-    let mut outbound = codec_in.framed(
+    let mut outbound = TLSCodec::new_inbound().framed(
         TcpStream::connect(&options.server_hostname)
             .await
             .context("cannot connect to outbound".to_owned() + &options.server_hostname)?,
     );
 
-    let codec_out = TLSCodec::new();
-    let mut inbound = codec_out.framed(inbound);
+    let mut inbound = TLSCodec::new_outbound().framed(inbound);
     let mut try_handshake = TryHandshake {};
     match try_handshake
         .try_handshake(&options, &mut outbound, &mut inbound)
@@ -299,6 +296,11 @@ pub async fn start(options: Arc<Opt>) -> Result<()> {
             .await
             .context("failed to accept inbound stream")?;
         let options = options.clone();
-        tokio::spawn(async move { handle(options, stream).await });
+        tokio::spawn(async move {
+            match handle(options, stream).await {
+                Err(e) => println!("{}", e),
+                Ok(_) => (),
+            }
+        });
     }
 }

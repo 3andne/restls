@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Result};
 use bytes::Buf;
 use futures_util::StreamExt;
-use std::{cmp::min, io::Cursor};
+use std::{
+    cmp::min,
+    io::{self, Cursor},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -13,15 +17,52 @@ use tokio_util::codec::{Decoder, Framed};
 
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
 
+enum RecordChecker {
+    Outbound,
+    NewInbound,
+    InboundAfterClientHello,
+}
+
+impl RecordChecker {
+    fn check(&mut self, record: &[u8]) -> bool {
+        use RecordChecker::*;
+        match self {
+            Outbound => true,
+            NewInbound => {
+                if &record[..3] == &[0x16, 0x03, 0x01] {
+                    *self = InboundAfterClientHello;
+                    true
+                } else {
+                    false
+                }
+            }
+            InboundAfterClientHello => {
+                record[0] >= 0x14 && record[0] <= 0x18 && &record[1..3] == &[0x03, 0x03]
+            }
+        }
+    }
+}
+
 pub struct TLSCodec {
+    checker: RecordChecker,
     buf: Vec<u8>,
     cursor: usize,
     pub enable_codec: bool,
 }
 
 impl TLSCodec {
-    pub fn new() -> Self {
+    pub fn new_outbound() -> Self {
         Self {
+            checker: RecordChecker::NewInbound,
+            buf: Vec::with_capacity(0x2000),
+            enable_codec: true,
+            cursor: 0,
+        }
+    }
+
+    pub fn new_inbound() -> Self {
+        Self {
+            checker: RecordChecker::Outbound,
             buf: Vec::with_capacity(0x2000),
             enable_codec: true,
             cursor: 0,
@@ -50,8 +91,12 @@ impl TLSCodec {
         let len = self.peek_record_length();
         &self.buf[self.cursor..self.cursor + len]
     }
-    pub fn peek_record_type(&self) -> u8 {
-        self.buf[self.cursor]
+    pub fn peek_record_type(&self) -> Result<u8> {
+        if !self.enable_codec {
+            Err(anyhow!("codec disabled due to invalid record"))
+        } else {
+            Ok(self.buf[self.cursor])
+        }
     }
 
     pub fn has_next(&self) -> bool {
@@ -92,12 +137,12 @@ impl Decoder for TLSCodec {
             return Ok(Some(()));
         }
 
-        if src.len() < 5 {
-            debug!("src len < 5");
-            return Ok(None);
-        }
         let mut cursor = 0;
         while cursor + 5 < src.len() {
+            if !self.checker.check(&src[cursor..]) {
+                self.enable_codec = false;
+                return self.decode(src);
+            }
             let record_len = ((src[cursor + 3] as u16) << 8 | (src[cursor + 4] as u16)) as usize;
             debug!("incoming record len: {}", record_len);
             if src.len() < cursor + 5 + record_len {
@@ -257,8 +302,11 @@ pub async fn copy_bidirectional_fallback(
             res = inbound.next() => {
                 match res {
                     Some(Ok(_)) => (),
-                    e => {
-                        e.ok_or(anyhow!("failed to read from inbound: "))??;
+                    Some(Err(e)) => {
+                        return Err(e);
+                    }
+                    None => {
+                        return Err(anyhow!("inbound eof"));
                     }
                 }
                 inbound.codec_mut().skip_to_end();
@@ -266,9 +314,25 @@ pub async fn copy_bidirectional_fallback(
             }
             res = outbound.next() => {
                 match res {
-                    Some(Ok(_))  => (),
-                    e => {
-                        e.ok_or(anyhow!("failed to read from outbound: "))??;
+                    Some(Ok(_)) => (),
+                    Some(Err(root_cause)) => {
+                        match root_cause.downcast_ref::<io::Error>() {
+                            Some(e) => {
+                                match e.kind() {
+                                    io::ErrorKind::ConnectionReset => {
+                                        inbound.get_mut().set_linger(Some(Duration::from_secs(0)))?;
+                                        inbound.get_mut().shutdown().await?;
+                                        return Ok(());
+                                    }
+                                    _ => return Err(root_cause),
+                                }
+                            },
+                            None => return Err(root_cause),
+                        }
+                    }
+                    None => {
+                        inbound.get_mut().write(&[]).await?;
+                        return Ok(());
                     }
                 }
                 outbound.codec_mut().skip_to_end();
