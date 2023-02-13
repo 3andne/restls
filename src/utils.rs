@@ -243,8 +243,11 @@ pub async fn copy_bidirectional(
             res = inbound.next() => {
                 match res {
                     Some(Ok(_)) => (),
-                    e => {
-                        e.ok_or(anyhow!("failed to read from inbound: "))??;
+                    None => {
+                        return Ok(());
+                    }
+                    Some(Err(e)) => {
+                        return Err(e);
                     }
                 }
                 while inbound.codec().has_next() {
@@ -257,7 +260,7 @@ pub async fn copy_bidirectional(
             n = outbound.read(&mut out_buf[5..]) => {
                 let n = n?;
                 if n == 0 {
-                    return Err(anyhow!("failed to read from outbound: "));
+                    return Ok(());
                 }
                 out_buf[3..5].copy_from_slice(&(n as u16).to_be_bytes());
                 inbound.get_mut().write_all(&out_buf[..n+5]).await?;

@@ -298,7 +298,7 @@ pub async fn start(options: Arc<Opt>) -> Result<()> {
         let options = options.clone();
         tokio::spawn(async move {
             match handle(options, stream).await {
-                Err(e) => println!("{}", e),
+                Err(e) => tracing::debug!("{}", e),
                 Ok(_) => (),
             }
         });
