@@ -7,7 +7,6 @@ pub const RECORD_HANDSHAKE: u8 = 0x16;
 pub const RECORD_APPLICATION_DATA: u8 = 0x17;
 pub const RECORD_CCS: u8 = 0x14;
 pub const RECORD_ALERT: u8 = 0x15;
-pub const RECORD_DUMMY: u8 = 0xff;
 
 // extension type
 pub const EXTENSION_SESSION_TICKET: u16 = 0x0023;
