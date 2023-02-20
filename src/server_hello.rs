@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub(crate) struct ServerHello {
-    pub(crate) is_tls_13: bool,
+    pub(crate) is_tls13: bool,
     pub(crate) server_random: [u8; 32],
     pub(crate) _key_share: Vec<u8>,
 }
@@ -54,13 +54,13 @@ impl ServerHello {
         }
         skip_length_padded::<1, _>(buf); // skip session id
         buf.advance(2 + 1 + 2); // skip cipher suite + compression method + Extensions Length
-        let mut is_tls_13 = false;
+        let mut is_tls13 = false;
         let mut key_share = Vec::new();
         while buf.has_remaining() {
             let ext = buf.get_u16();
             match ext {
                 EXTENSION_SUPPORTED_VERSIONS => {
-                    is_tls_13 = Self::read_supported_version(buf);
+                    is_tls13 = Self::read_supported_version(buf);
                 }
                 EXTENSION_KEY_SHARE => {
                     key_share = Self::read_key_share(buf);
@@ -71,7 +71,7 @@ impl ServerHello {
             }
         }
         Ok(ServerHello {
-            is_tls_13,
+            is_tls13,
             server_random,
             _key_share: key_share,
         })

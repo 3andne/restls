@@ -1,6 +1,7 @@
 // protocol constants
 pub const REQUIRED_SESSION_ID_LEN: usize = 32;
-pub const REQUIRED_HMAC_LEN: usize = 16;
+pub const RESTLS_HANDSHAKE_HMAC_LEN: usize = 16;
+pub const RESTLS_APPDATA_HMAC_LEN: usize = 8;
 
 // record type
 pub const RECORD_HANDSHAKE: u8 = 0x16;
@@ -17,6 +18,8 @@ pub const EXTENSION_KEY_SHARE: u16 = 0x0033;
 // handshake type:
 pub const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 01;
 pub const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 02;
+pub const HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE: u8 = 0x10;
+pub const HANDSHAKE_TYPE_SERVER_HELLO_DONE: u8 = 0x0e;
 
 pub const HELLO_RETRY_RANDOM: [u8; 32] = [
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,

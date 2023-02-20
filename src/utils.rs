@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use bytes::Buf;
 use futures_util::StreamExt;
+use hmac::Hmac;
+use sha1::Sha1;
 use std::{
     cmp::min,
     io::{self, Cursor},
@@ -15,7 +17,11 @@ use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
 
+use crate::common::RESTLS_APPDATA_HMAC_LEN;
+
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
+
+pub type HmacSha1 = Hmac<Sha1>;
 
 enum RecordChecker {
     Outbound,
@@ -81,22 +87,36 @@ impl TLSCodec {
         5 + ((self.buf[self.cursor + 3] as usize) << 8 | self.buf[self.cursor + 4] as usize)
     }
 
-    pub fn next_record(&mut self) -> &mut [u8] {
-        let start = self.cursor;
-        self.cursor += self.peek_record_length();
-        &mut self.buf[start..self.cursor]
-    }
-
-    pub fn peek_record(&self) -> &[u8] {
-        let len = self.peek_record_length();
-        &self.buf[self.cursor..self.cursor + len]
-    }
-    pub fn peek_record_type(&self) -> Result<u8> {
+    fn check_codec_failure(&self) -> Result<()> {
         if !self.enable_codec {
             Err(anyhow!("codec disabled due to invalid record"))
         } else {
-            Ok(self.buf[self.cursor])
+            Ok(())
         }
+    }
+
+    pub fn next_record(&mut self) -> Result<&mut [u8]> {
+        self.check_codec_failure()?;
+        let start = self.cursor;
+        self.cursor += self.peek_record_length();
+        Ok(&mut self.buf[start..self.cursor])
+    }
+
+    pub fn peek_record(&self) -> Result<&[u8]> {
+        self.check_codec_failure()?;
+        let len = self.peek_record_length();
+        Ok(&self.buf[self.cursor..self.cursor + len])
+    }
+
+    pub fn peek_record_mut(&mut self) -> Result<&mut [u8]> {
+        self.check_codec_failure()?;
+        let len = self.peek_record_length();
+        Ok(&mut self.buf[self.cursor..self.cursor + len])
+    }
+
+    pub fn peek_record_type(&self) -> Result<u8> {
+        self.check_codec_failure()?;
+        Ok(self.buf[self.cursor])
     }
 
     pub fn has_next(&self) -> bool {
@@ -182,11 +202,16 @@ pub(crate) fn skip_length_padded<const N: usize, T: Buf>(buf: &mut T) -> usize {
     len
 }
 
-pub(crate) fn read_length_padded<const N: usize, T: Buf>(buf: &mut T, copy_to: &mut [u8]) -> usize {
+pub(crate) fn read_length_padded<const N: usize, T: Buf>(
+    buf: &mut T,
+    copy_to: &mut [u8],
+) -> Result<usize> {
     let len = read_length_padded_header::<N, T>(buf);
-    assert!(copy_to.len() >= len);
+    if copy_to.len() < len {
+        return Err(anyhow!("truncated length padded content"));
+    }
     buf.copy_to_slice(&mut copy_to[..len]);
-    len
+    Ok(len)
 }
 
 pub(crate) fn extend_from_length_prefixed<const N: usize, T: Buf>(
@@ -222,18 +247,21 @@ pub(crate) fn xor_bytes(secret: &[u8], msg: &mut [u8]) {
     }
 }
 
-pub async fn copy_bidirectional(
-    mut inbound: TLSStream,
-    mut outbound: TcpStream,
-    mut content_offset: usize,
-) -> Result<()> {
+const CONTENT_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN;
+
+pub async fn copy_bidirectional(mut inbound: TLSStream, mut outbound: TcpStream) -> Result<()> {
     let mut out_buf = [0; 0x2000];
     out_buf[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
     while inbound.codec().has_next() {
         outbound
-            .write_all(&inbound.codec_mut().next_record()[content_offset..])
+            .write_all(
+                &inbound
+                    .codec_mut()
+                    .next_record()
+                    .expect("unexpected error: this record should have been checked")
+                    [CONTENT_OFFSET..],
+            )
             .await?;
-        content_offset = 5;
     }
 
     inbound.codec_mut().reset();
@@ -252,18 +280,18 @@ pub async fn copy_bidirectional(
                 }
                 while inbound.codec().has_next() {
                     outbound
-                        .write_all(&inbound.codec_mut().next_record()[5..])
+                        .write_all(&inbound.codec_mut().next_record().expect("todo: verification")[CONTENT_OFFSET..])
                         .await?;
                 }
                 inbound.codec_mut().reset();
             }
-            n = outbound.read(&mut out_buf[5..]) => {
+            n = outbound.read(&mut out_buf[CONTENT_OFFSET..]) => {
                 let n = n?;
                 if n == 0 {
                     return Ok(());
                 }
-                out_buf[3..5].copy_from_slice(&(n as u16).to_be_bytes());
-                inbound.get_mut().write_all(&out_buf[..n+5]).await?;
+                out_buf[3..5].copy_from_slice(&(n as u16 + 8).to_be_bytes());
+                inbound.get_mut().write_all(&out_buf[..n+CONTENT_OFFSET]).await?;
             }
         }
     }
