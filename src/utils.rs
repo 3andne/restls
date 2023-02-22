@@ -8,11 +8,7 @@ use std::{
     io::{self, Cursor},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    select,
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, select};
 use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
@@ -247,53 +243,19 @@ pub(crate) fn xor_bytes(secret: &[u8], msg: &mut [u8]) {
     }
 }
 
-const CONTENT_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN;
+const CONTENT_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN + 2;
 
-pub async fn copy_bidirectional(mut inbound: TLSStream, mut outbound: TcpStream) -> Result<()> {
-    let mut out_buf = [0; 0x2000];
-    out_buf[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
-    while inbound.codec().has_next() {
-        outbound
-            .write_all(
-                &inbound
-                    .codec_mut()
-                    .next_record()
-                    .expect("unexpected error: this record should have been checked")
-                    [CONTENT_OFFSET..],
-            )
-            .await?;
-    }
+pub async fn tcp_rst(stream: &mut TcpStream) -> Result<()> {
+    stream.set_linger(Some(Duration::from_secs(0)))?;
+    stream.shutdown().await?;
+    return Ok(());
+}
 
-    inbound.codec_mut().reset();
-
-    loop {
-        select! {
-            res = inbound.next() => {
-                match res {
-                    Some(Ok(_)) => (),
-                    None => {
-                        return Ok(());
-                    }
-                    Some(Err(e)) => {
-                        return Err(e);
-                    }
-                }
-                while inbound.codec().has_next() {
-                    outbound
-                        .write_all(&inbound.codec_mut().next_record().expect("todo: verification")[CONTENT_OFFSET..])
-                        .await?;
-                }
-                inbound.codec_mut().reset();
-            }
-            n = outbound.read(&mut out_buf[CONTENT_OFFSET..]) => {
-                let n = n?;
-                if n == 0 {
-                    return Ok(());
-                }
-                out_buf[3..5].copy_from_slice(&(n as u16 + 8).to_be_bytes());
-                inbound.get_mut().write_all(&out_buf[..n+CONTENT_OFFSET]).await?;
-            }
-        }
+async fn inbound_read_helper(inbound: &mut TLSStream) -> Option<Result<()>> {
+    if inbound.codec().has_next() {
+        Some(Ok(()))
+    } else {
+        inbound.next().await
     }
 }
 
@@ -347,18 +309,16 @@ pub async fn copy_bidirectional_fallback(
                 match res {
                     Some(Ok(_)) => (),
                     Some(Err(root_cause)) => {
-                        match root_cause.downcast_ref::<io::Error>() {
+                        return match root_cause.downcast_ref::<io::Error>() {
                             Some(e) => {
                                 match e.kind() {
                                     io::ErrorKind::ConnectionReset => {
-                                        inbound.get_mut().set_linger(Some(Duration::from_secs(0)))?;
-                                        inbound.get_mut().shutdown().await?;
-                                        return Ok(());
+                                        tcp_rst(inbound.get_mut()).await
                                     }
-                                    _ => return Err(root_cause),
+                                    _ => Err(root_cause),
                                 }
                             },
-                            None => return Err(root_cause),
+                            None => Err(root_cause),
                         }
                     }
                     None => {

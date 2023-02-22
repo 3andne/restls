@@ -2,6 +2,8 @@
 pub const REQUIRED_SESSION_ID_LEN: usize = 32;
 pub const RESTLS_HANDSHAKE_HMAC_LEN: usize = 16;
 pub const RESTLS_APPDATA_HMAC_LEN: usize = 8;
+pub const RESTLS_APPDATA_LEN_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN;
+pub const RESTLS_APPDATA_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN + 2;
 
 // record type
 pub const RECORD_HANDSHAKE: u8 = 0x16;
@@ -25,3 +27,8 @@ pub const HELLO_RETRY_RANDOM: [u8; 32] = [
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
+
+pub const TO_CLIENT_MAGIC: &'static [u8] = "server-to-client".as_bytes();
+pub const TO_SERVER_MAGIC: &'static [u8] = "client-to-server".as_bytes();
+
+pub const BUF_SIZE: usize = 0x2000;

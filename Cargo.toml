@@ -18,3 +18,4 @@ hmac = "*"
 tokio-util = { version = "*", features = ["full"] }
 futures-util = "0.3.26"
 sha2 = "*"
+rand = "0.8.5"

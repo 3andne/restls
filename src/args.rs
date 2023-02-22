@@ -61,6 +61,16 @@ pub struct Opt {
     /// the password to authenticate connections
     #[structopt(short = "p", long, parse(from_str = make_password))]
     pub password: Password,
+
+    /// The target length of early server data. Packets that exceed this
+    /// will be truncated.
+    #[structopt(long, default_value = "1385")]
+    pub mtu: u16,
+
+    /// The minimal length of server data. Packets that below this
+    /// will be padded.
+    #[structopt(long, default_value = "15")]
+    pub min_record_len: u16,
 }
 
 // #[derive(Debug)]
