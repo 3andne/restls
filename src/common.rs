@@ -3,7 +3,8 @@ pub const REQUIRED_SESSION_ID_LEN: usize = 32;
 pub const RESTLS_HANDSHAKE_HMAC_LEN: usize = 16;
 pub const RESTLS_APPDATA_HMAC_LEN: usize = 8;
 pub const RESTLS_APPDATA_LEN_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN;
-pub const RESTLS_APPDATA_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN + 2;
+pub const RESTLS_MASK_LEN: usize = 4;
+pub const RESTLS_APPDATA_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN + RESTLS_MASK_LEN;
 
 // record type
 pub const RECORD_HANDSHAKE: u8 = 0x16;

@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use bytes::Buf;
 use futures_util::StreamExt;
-use hmac::Hmac;
-use sha1::Sha1;
+use rand::Rng;
 use std::{
     cmp::min,
     io::{self, Cursor},
@@ -13,11 +12,7 @@ use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
 
-use crate::common::RESTLS_APPDATA_HMAC_LEN;
-
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
-
-pub type HmacSha1 = Hmac<Sha1>;
 
 enum RecordChecker {
     Outbound,
@@ -243,20 +238,10 @@ pub(crate) fn xor_bytes(secret: &[u8], msg: &mut [u8]) {
     }
 }
 
-const CONTENT_OFFSET: usize = 5 + RESTLS_APPDATA_HMAC_LEN + 2;
-
 pub async fn tcp_rst(stream: &mut TcpStream) -> Result<()> {
     stream.set_linger(Some(Duration::from_secs(0)))?;
     stream.shutdown().await?;
     return Ok(());
-}
-
-async fn inbound_read_helper(inbound: &mut TLSStream) -> Option<Result<()>> {
-    if inbound.codec().has_next() {
-        Some(Ok(()))
-    } else {
-        inbound.next().await
-    }
 }
 
 pub async fn copy_bidirectional_fallback(
@@ -329,6 +314,124 @@ pub async fn copy_bidirectional_fallback(
                 outbound.codec_mut().skip_to_end();
                 inbound.get_mut().write_all(outbound.codec().raw_buf()).await?;
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RestlsCommand {
+    Noop,
+    Response(u8),
+}
+
+impl RestlsCommand {
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        match buf[0] {
+            0 => Self::Noop,
+            1 => Self::Response(buf[1]),
+            _ => unimplemented!("unsupported command type"),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 2] {
+        match self {
+            Self::Noop => [0, 0],
+            Self::Response(count) => [1, *count],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TargetLen(u16, u16);
+
+fn parse_int(cursor: &mut Cursor<&[u8]>) -> u16 {
+    let mut res = 0;
+    let len = cursor.chunk().len();
+    let mut i = 0;
+    while i < len {
+        let b = cursor.chunk()[i];
+        if b <= b'9' && b >= b'0' {
+            res = res * 10 + (cursor.chunk()[i] - b'0') as u32;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    assert!(res < u16::MAX as u32);
+    cursor.advance(i);
+    res as u16
+}
+
+impl TargetLen {
+    fn from_bytes(cursor: &mut Cursor<&[u8]>) -> Self {
+        let base = parse_int(cursor);
+        if !cursor.has_remaining() {
+            return Self(base, 0);
+        }
+        match cursor.chunk()[0] {
+            b'~' => {
+                cursor.advance(1);
+                Self(base, parse_int(cursor))
+            }
+            b'?' => {
+                cursor.advance(1);
+                let rng = parse_int(cursor);
+                assert!((rng as u32) + (base as u32) < u16::MAX as u32);
+                let new_base = base + rand::thread_rng().gen_range(0..rng);
+                Self(new_base, 0)
+            }
+            _ => Self(base, 0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        if self.1 == 0 {
+            self.0 as usize
+        } else {
+            (self.0 + rand::thread_rng().gen_range(0..self.1)) as usize
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Line {
+    target_len: TargetLen,
+    pub command: RestlsCommand,
+}
+
+impl Line {
+    pub fn len(&self) -> usize {
+        self.target_len.len()
+    }
+
+    pub fn from_str(line_raw: &str) -> Self {
+        let mut c = Cursor::new(line_raw.as_bytes());
+        let target_len = TargetLen::from_bytes(&mut c);
+        if !c.has_remaining() {
+            return Self {
+                target_len,
+                command: RestlsCommand::Noop,
+            };
+        }
+        match c.get_u8() {
+            b'<' => {
+                let response_count = parse_int(&mut c);
+                assert!(
+                    !c.has_remaining(),
+                    "unexpected content in restls command {:?}",
+                    String::from_utf8(c.chunk().to_vec()).unwrap()
+                );
+                assert!(
+                    response_count < 255,
+                    "too many response in restls script, expect < 255, actual {}",
+                    response_count
+                );
+                return Self {
+                    target_len,
+                    command: RestlsCommand::Response(response_count as u8),
+                };
+            }
+            _ => unimplemented!("unsupported command in restls script"),
         }
     }
 }

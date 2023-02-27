@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use blake3::Hasher;
 use futures_util::stream::StreamExt;
 use hmac::Mac;
 use rand::Rng;
@@ -12,16 +13,16 @@ use tokio_util::codec::Decoder;
 use tracing::debug;
 
 use crate::{
-    args::Opt,
+    args::{Opt, Script},
     client_hello::ClientHello,
     client_key_exchange::ClientKeyExchange,
     common::{
         BUF_SIZE, RECORD_ALERT, RECORD_APPLICATION_DATA, RECORD_CCS, RECORD_HANDSHAKE,
         RESTLS_APPDATA_HMAC_LEN, RESTLS_APPDATA_LEN_OFFSET, RESTLS_APPDATA_OFFSET,
-        RESTLS_HANDSHAKE_HMAC_LEN, TO_CLIENT_MAGIC, TO_SERVER_MAGIC,
+        RESTLS_HANDSHAKE_HMAC_LEN, RESTLS_MASK_LEN, TO_CLIENT_MAGIC, TO_SERVER_MAGIC,
     },
     server_hello::ServerHello,
-    utils::{copy_bidirectional_fallback, tcp_rst, xor_bytes, HmacSha1, TLSCodec, TLSStream},
+    utils::{copy_bidirectional_fallback, tcp_rst, xor_bytes, RestlsCommand, TLSCodec, TLSStream},
 };
 
 #[derive(Debug)]
@@ -135,15 +136,19 @@ impl TLS12Flow {
     }
 }
 
+enum WriteToServerResult {
+    Ok,
+    MaybeCloseNotify,
+}
+
 pub struct RestlsState<'a> {
     client_hello: Option<ClientHello>,
     server_hello: Option<ServerHello>,
     client_finished: Vec<u8>,
-    restls_password: &'a [u8],
+    restls_password: &'a [u8; 32],
     to_client_counter: u32,
     to_server_counter: u32,
-    to_client_raw_counter: u32,
-    mtu: usize,
+    script: &'a Script,
     min_record_len: usize,
     id: usize,
 }
@@ -153,11 +158,11 @@ fn sample_slice(data: &[u8]) -> &[u8] {
 }
 
 impl<'a> RestlsState<'a> {
-    fn restls_hmac(&self) -> HmacSha1 {
-        HmacSha1::new_from_slice(self.restls_password).expect("sha1 should take key of any size")
+    fn restls_hmac(&self) -> Hasher {
+        Hasher::new_keyed(self.restls_password)
     }
 
-    pub fn restls_appdata_auth_hmac(&self, is_to_client: bool) -> HmacSha1 {
+    pub fn restls_appdata_auth_hmac(&self, is_to_client: bool) -> Hasher {
         let mut hasher = self.restls_hmac();
         hasher.update(&self.server_hello.as_ref().unwrap().server_random);
         if is_to_client {
@@ -170,7 +175,13 @@ impl<'a> RestlsState<'a> {
         hasher
     }
 
-    pub fn read_app_data<'b>(&mut self, record: &'b mut [u8]) -> Result<&'b [u8]> {
+    pub fn read_app_data<'b>(&mut self, record: &'b mut [u8]) -> Result<(&'b [u8], RestlsCommand)> {
+        if record.len() < RESTLS_APPDATA_OFFSET {
+            return Err(anyhow!(
+                "[{}]reject: restls application data isn't long enough",
+                self.id
+            ));
+        }
         if &record[..3] != &[RECORD_APPLICATION_DATA, 0x03, 0x03] {
             return Err(anyhow!(
                 "[{}]reject: restls application data must have 0x17 header, got: {:?}",
@@ -202,65 +213,90 @@ impl<'a> RestlsState<'a> {
         let mut hmac_mask = self.restls_appdata_auth_hmac(false);
         hmac_mask.update(sample_slice(&record[RESTLS_APPDATA_OFFSET..]));
         let mask = hmac_mask.finalize().into_bytes();
-        let data_len_bytes = &mut record[RESTLS_APPDATA_LEN_OFFSET..][..2];
-        xor_bytes(&mask[..2], data_len_bytes);
-        let data_len = (data_len_bytes[0] as usize) << 8 | (data_len_bytes[1] as usize);
+        let masked_section = &mut record[RESTLS_APPDATA_LEN_OFFSET..][..RESTLS_MASK_LEN];
+        xor_bytes(&mask[..RESTLS_MASK_LEN], masked_section);
+        let data_len = (masked_section[0] as usize) << 8 | (masked_section[1] as usize);
+        let command = RestlsCommand::from_bytes(&masked_section[2..]);
         self.to_server_counter += 1;
         debug!("[{}]read_app_data: data_len {}", self.id, data_len);
-        Ok(&record[RESTLS_APPDATA_OFFSET..][..data_len])
+        Ok((&record[RESTLS_APPDATA_OFFSET..][..data_len], command))
     }
 
-    pub fn write_app_data_header<'b>(
-        &mut self,
-        record: &'b mut [u8],
-        data_len: usize,
-    ) -> Result<(usize, usize)> {
-        assert!(record.len() >= 1500);
-        let mtu = (self.mtu as isize + rand::thread_rng().gen_range(-50..50))
-            .try_into()
-            .unwrap();
+    fn act_according_to_script(&self, data_len: usize) -> (usize, usize, RestlsCommand) {
+        let line = self.script.get_line(self.to_client_counter as usize);
         let min_record_len = self.min_record_len + rand::thread_rng().gen_range(0..100);
-        let (real_data_len, padding) = match (
-            data_len < min_record_len,
-            self.to_client_raw_counter < 5,
-            data_len > mtu,
-        ) {
-            (true, _, _) => (data_len, min_record_len - data_len),
-            (_, false, _) => (data_len, 0),
-            (_, true, true) => (mtu, 0),
-            (_, true, false) => (data_len, mtu - data_len),
+        let (real_data_len, padding) = match (data_len < min_record_len, line) {
+            (_, Some(line)) => {
+                let target_len = line.len();
+                if target_len < data_len {
+                    (target_len, 0)
+                } else {
+                    (data_len, target_len - data_len)
+                }
+            }
+            (true, None) => (data_len, min_record_len - data_len),
+            (false, None) => (data_len, 0),
         };
-        if padding > 0 {
-            rand::thread_rng()
-                .fill(&mut record[RESTLS_APPDATA_OFFSET + real_data_len..][..padding]);
+        let command = match line {
+            Some(line) => line.command,
+            None => RestlsCommand::Noop,
+        };
+        (real_data_len, padding, command)
+    }
+
+    fn prepare_packet_to_client(&mut self, record: &mut [u8], data_len: usize) -> (usize, usize) {
+        let (data_len, padding_len, command) = self.act_according_to_script(data_len);
+        if padding_len > 0 {
+            rand::thread_rng().fill(&mut record[RESTLS_APPDATA_OFFSET + data_len..][..padding_len]);
         }
+        self.prepare_app_data_header(record, data_len, padding_len, command);
+        (data_len, data_len + padding_len + RESTLS_APPDATA_OFFSET)
+    }
+
+    fn prepare_app_data_header(
+        &mut self,
+        record: &mut [u8],
+        data_len: usize,
+        padding_len: usize,
+        command: RestlsCommand,
+    ) {
+        assert!(record.len() >= 1500);
+
         let mut hmac_mask = self.restls_appdata_auth_hmac(true);
         hmac_mask.update(sample_slice(
-            &record[RESTLS_APPDATA_OFFSET..][..real_data_len + padding],
+            &record[RESTLS_APPDATA_OFFSET..][..data_len + padding_len],
         ));
         let mask = hmac_mask.finalize().into_bytes();
-        record[RESTLS_APPDATA_LEN_OFFSET..][..2]
-            .copy_from_slice(&(real_data_len as u16).to_be_bytes());
-        xor_bytes(&mask[..2], &mut record[RESTLS_APPDATA_LEN_OFFSET..]);
+        record[RESTLS_APPDATA_LEN_OFFSET..][..2].copy_from_slice(&(data_len as u16).to_be_bytes());
+
+        record[RESTLS_APPDATA_LEN_OFFSET + 2..][..2].copy_from_slice(&command.to_bytes());
+        xor_bytes(
+            &mask[..RESTLS_MASK_LEN],
+            &mut record[RESTLS_APPDATA_LEN_OFFSET..],
+        );
         let mut hmac_auth = self.restls_appdata_auth_hmac(true);
-        hmac_auth.update(&record[RESTLS_APPDATA_LEN_OFFSET..][..2 + real_data_len + padding]);
+        hmac_auth.update(
+            &record[RESTLS_APPDATA_LEN_OFFSET..][..RESTLS_MASK_LEN + data_len + padding_len],
+        );
         let auth = hmac_auth.finalize().into_bytes();
         record[5..5 + RESTLS_APPDATA_HMAC_LEN].copy_from_slice(&auth[..RESTLS_APPDATA_HMAC_LEN]);
         record[0..3].copy_from_slice(&[0x17, 0x3, 0x3]);
-        record[3..5].copy_from_slice(&((real_data_len + padding + 10) as u16).to_be_bytes());
-        self.to_client_counter += 1;
-        if real_data_len == data_len {
-            self.to_client_raw_counter += 1;
-        }
-        debug!(
-            "[{}]write_header: data_len {}, padding: {}, mask: {:?}, auth: {:?}",
-            self.id,
-            real_data_len,
-            padding,
-            &mask[..2],
-            &auth[..RESTLS_APPDATA_HMAC_LEN]
+        record[3..5].copy_from_slice(
+            &((data_len + padding_len + RESTLS_APPDATA_HMAC_LEN + RESTLS_MASK_LEN) as u16)
+                .to_be_bytes(),
         );
-        Ok((real_data_len, real_data_len + padding + 15))
+        debug!(
+            "[{}]write_header: data_len {}, padding: {}, mask: {:?}, auth: {:?}
+            to_server {}, to_client {}",
+            self.id,
+            data_len,
+            padding_len,
+            &mask[..RESTLS_MASK_LEN],
+            &auth[..RESTLS_APPDATA_HMAC_LEN],
+            self.to_server_counter,
+            self.to_client_counter,
+        );
+        self.to_client_counter += 1;
     }
 
     async fn read_from_stream(&self, stream: &mut TLSStream) -> Result<()> {
@@ -468,8 +504,8 @@ impl<'a> RestlsState<'a> {
                     .expect("unexpected error: record has been checked");
                 ClientKeyExchange::check(
                     &mut Cursor::new(maybe_cke),
-                    self.restls_password,
                     self.client_hello.as_ref().unwrap(),
+                    self.restls_hmac(),
                 )?;
                 flow.cke_verified()
             }
@@ -527,6 +563,7 @@ impl<'a> RestlsState<'a> {
     }
 
     fn check_tls12_session_ticket(&self) -> Result<()> {
+        debug!("checking tls12 session ticket");
         let mut hasher = self.restls_hmac();
         let client_hello = self.client_hello.as_ref().unwrap();
         hasher.update(&client_hello.session_ticket);
@@ -534,7 +571,7 @@ impl<'a> RestlsState<'a> {
         if &client_hello.session_id[RESTLS_HANDSHAKE_HMAC_LEN..]
             != &actual_hash[..RESTLS_HANDSHAKE_HMAC_LEN]
         {
-            Err(anyhow!("reject: tls 1.2 client pub key mismatched"))
+            Err(anyhow!("reject: tls 1.2 session ticket mismatched"))
         } else {
             Ok(())
         }
@@ -560,6 +597,85 @@ impl<'a> RestlsState<'a> {
         res
     }
 
+    async fn write_server_data_to_client(
+        &mut self,
+        inbound: &mut TLSStream,
+        out_buf: &mut [u8],
+        mut n: usize,
+    ) -> Result<()> {
+        let mut written = 0;
+        while written < n {
+            if (BUF_SIZE - written) < 1500 {
+                for i in 0..BUF_SIZE - written {
+                    out_buf[i] = out_buf[written + i];
+                }
+                n -= written;
+                written = 0;
+            }
+            let (new_written, packet_size) =
+                self.prepare_packet_to_client(&mut out_buf[written..], n - written);
+            inbound
+                .get_mut()
+                .write_all(&out_buf[written..][..packet_size])
+                .await
+                .context("inbound.write_all failed: ")?;
+            written += new_written;
+        }
+        Ok(())
+    }
+
+    async fn write_client_data_to_server(
+        &mut self,
+        inbound: &mut TLSStream,
+        outbound: &mut TcpStream,
+        out_buf: &mut [u8],
+    ) -> Result<WriteToServerResult> {
+        while inbound.codec().has_next() {
+            let record = inbound.codec_mut().next_record()?;
+            if record[0] == RECORD_ALERT {
+                return Ok(WriteToServerResult::MaybeCloseNotify);
+            }
+            let (record, command) = match self.read_app_data(record) {
+                Ok(r) => r,
+                Err(e) => {
+                    return if self.server_hello.as_ref().unwrap().is_tls13
+                        && (self.to_client_counter > 0 || self.to_server_counter > 0)
+                    {
+                        // this will probably be a close notify.
+                        // we'll ignore it.
+                        Ok(WriteToServerResult::MaybeCloseNotify)
+                    } else {
+                        Err(e)
+                    };
+                }
+            };
+            if record.len() > 0 {
+                outbound
+                    .write_all(record)
+                    .await
+                    .context("outbound.write_all failed: ")?;
+            }
+            match command {
+                RestlsCommand::Noop => (),
+                RestlsCommand::Response(count) => {
+                    debug!("generating {} fake responses to client", count);
+                    for _ in 0..count {
+                        let (_, packet_size) = self.prepare_packet_to_client(out_buf, 0);
+                        inbound
+                            .get_mut()
+                            .write_all(&out_buf[..packet_size])
+                            .await
+                            .context(
+                                "write_client_data_to_server RestlsCommand::Response failed: ",
+                            )?;
+                    }
+                }
+            }
+        }
+        inbound.codec_mut().reset();
+        Ok(WriteToServerResult::Ok)
+    }
+
     pub async fn copy_bidirectional(
         &mut self,
         inbound: &mut TLSStream,
@@ -570,50 +686,17 @@ impl<'a> RestlsState<'a> {
             select! {
                 res = self.read_from_stream(inbound) => {
                     res?;
-                    while inbound.codec().has_next() {
-                        let record = inbound.codec_mut().next_record()?;
-                        if record[0] == RECORD_ALERT {
-                            return Ok(());
-                        }
-                        let record = match self.read_app_data(record) {
-                            Ok(record) => record,
-                            Err(e) => {
-                                return if self.server_hello.as_ref().unwrap().is_tls13
-                                    && self.to_client_counter > 0
-                                    && self.to_server_counter > 0
-                                {
-                                    // this will probably be a close notify.
-                                    // we'll ignore it.
-                                    Ok(())
-                                } else {
-                                    Err(e)
-                                }
-                            }
-                        };
-                        if record.len() > 0 {
-                            outbound.write_all(record).await.context("outbound.write_all failed: ")?;
-                        }
-                    }
-                    inbound.codec_mut().reset();
+                    match self.write_client_data_to_server(inbound, outbound, &mut out_buf).await? {
+                        WriteToServerResult::MaybeCloseNotify => return Ok(()),
+                        _ => (),
+                    };
                 }
                 n = outbound.read(&mut out_buf[RESTLS_APPDATA_OFFSET..]) => {
-                    let mut n = n.context("outbound.read failed: ")?;
+                    let n = n.context("outbound.read failed: ")?;
                     if n == 0 {
                         return Ok(());
                     }
-                    let mut written = 0;
-                    while written < n {
-                        if (BUF_SIZE - written) < 1500 {
-                            for i in 0..BUF_SIZE - written {
-                                out_buf[i] = out_buf[written + i];
-                            }
-                            n -= written;
-                            written = 0;
-                        }
-                        let (new_written, packet_size) = self.write_app_data_header(&mut out_buf[written..], n - written)?;
-                        inbound.get_mut().write_all(&out_buf[written..][..packet_size]).await.context("inbound.write_all failed: ")?;
-                        written += new_written;
-                    }
+                    self.write_server_data_to_client(inbound, &mut out_buf, n).await?;
                 }
             }
         }
@@ -660,13 +743,12 @@ pub async fn handle(options: Arc<Opt>, inbound: TcpStream, id: usize) -> Result<
     let mut try_handshake = RestlsState {
         client_hello: None,
         server_hello: None,
-        restls_password: options.password.as_bytes(),
+        restls_password: &options.password.as_bytes(),
         client_finished: Vec::new(),
         to_client_counter: 0,
         to_server_counter: 0,
-        to_client_raw_counter: 0,
-        mtu: options.mtu as usize,
-        min_record_len: options.mtu as usize,
+        script: &options.script,
+        min_record_len: options.min_record_len as usize,
         id,
     };
     match try_handshake
