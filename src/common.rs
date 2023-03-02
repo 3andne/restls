@@ -32,4 +32,4 @@ pub const HELLO_RETRY_RANDOM: [u8; 32] = [
 pub const TO_CLIENT_MAGIC: &'static [u8] = "server-to-client".as_bytes();
 pub const TO_SERVER_MAGIC: &'static [u8] = "client-to-server".as_bytes();
 
-pub const BUF_SIZE: usize = 0x2000;
+pub const BUF_SIZE: usize = 0x3000;

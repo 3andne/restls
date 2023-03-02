@@ -12,6 +12,8 @@ use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
 
+use crate::common::{BUF_SIZE, RESTLS_APPDATA_OFFSET};
+
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
 
 enum RecordChecker {
@@ -433,5 +435,87 @@ impl Line {
             }
             _ => unimplemented!("unsupported command in restls script"),
         }
+    }
+}
+
+pub struct DoubleCursorBuf {
+    inner: [u8; BUF_SIZE],
+    front_cursor: usize,
+    back_cursor: usize,
+    load_len: usize,
+}
+
+impl DoubleCursorBuf {
+    pub fn new() -> Self {
+        Self {
+            inner: [0; BUF_SIZE],
+            front_cursor: 0,
+            back_cursor: RESTLS_APPDATA_OFFSET,
+            load_len: 0,
+        }
+    }
+
+    fn shift_to_head(&mut self) {
+        if self.front_cursor == 0 {
+            return;
+        }
+        unsafe {
+            std::ptr::copy(
+                self.inner[self.front_cursor..].as_ptr(),
+                self.inner.as_mut_ptr(),
+                self.back_cursor - self.front_cursor,
+            );
+        }
+        self.back_cursor -= self.front_cursor;
+        self.front_cursor = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.back_cursor - self.front_cursor - RESTLS_APPDATA_OFFSET
+    }
+
+    pub fn load_mut(&mut self) -> &mut [u8] {
+        &mut self.inner
+            [self.front_cursor..self.front_cursor + RESTLS_APPDATA_OFFSET + self.load_len]
+    }
+
+    pub fn release(&mut self) {
+        self.front_cursor += self.load_len;
+        self.load_len = 0;
+        if self.front_cursor + RESTLS_APPDATA_OFFSET == self.back_cursor {
+            self.reset()
+        }
+    }
+
+    pub fn load(&mut self, len: usize) {
+        assert!(self.load_len == 0);
+        if len > self.len() {
+            if self.inner.len() - self.front_cursor < 1500 {
+                self.shift_to_head();
+            }
+            let padding_len = len - self.len();
+            rand::thread_rng()
+                .fill(&mut self.inner[self.back_cursor..self.back_cursor + padding_len]);
+            self.back_cursor += padding_len;
+            assert!(self.back_cursor < self.inner.len());
+        }
+        self.load_len = len;
+    }
+
+    pub fn reset(&mut self) {
+        self.front_cursor = 0;
+        self.back_cursor = RESTLS_APPDATA_OFFSET;
+    }
+
+    pub fn back_mut(&mut self) -> &mut [u8] {
+        if self.inner.len() - self.back_cursor < 1500 {
+            self.shift_to_head()
+        }
+        &mut self.inner[self.back_cursor..]
+    }
+
+    pub fn advance_back(&mut self, len: usize) {
+        assert!(self.back_cursor + len <= self.inner.len());
+        self.back_cursor += len;
     }
 }

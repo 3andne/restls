@@ -22,7 +22,10 @@ use crate::{
         RESTLS_HANDSHAKE_HMAC_LEN, RESTLS_MASK_LEN, TO_CLIENT_MAGIC, TO_SERVER_MAGIC,
     },
     server_hello::ServerHello,
-    utils::{copy_bidirectional_fallback, tcp_rst, xor_bytes, RestlsCommand, TLSCodec, TLSStream},
+    utils::{
+        copy_bidirectional_fallback, tcp_rst, xor_bytes, DoubleCursorBuf, RestlsCommand, TLSCodec,
+        TLSStream,
+    },
 };
 
 #[derive(Debug)]
@@ -137,7 +140,7 @@ impl TLS12Flow {
 }
 
 enum WriteToServerResult {
-    Ok,
+    Ok((u8, u8)),
     MaybeCloseNotify,
 }
 
@@ -244,28 +247,15 @@ impl<'a> RestlsState<'a> {
         (real_data_len, padding, command)
     }
 
-    fn prepare_packet_to_client(&mut self, record: &mut [u8], data_len: usize) -> (usize, usize) {
-        let (data_len, padding_len, command) = self.act_according_to_script(data_len);
-        if padding_len > 0 {
-            rand::thread_rng().fill(&mut record[RESTLS_APPDATA_OFFSET + data_len..][..padding_len]);
-        }
-        self.prepare_app_data_header(record, data_len, padding_len, command);
-        (data_len, data_len + padding_len + RESTLS_APPDATA_OFFSET)
-    }
-
     fn prepare_app_data_header(
         &mut self,
-        record: &mut [u8],
+        out_buf: &mut DoubleCursorBuf,
         data_len: usize,
-        padding_len: usize,
         command: RestlsCommand,
     ) {
-        assert!(record.len() >= 1500);
-
+        let record = out_buf.load_mut();
         let mut hmac_mask = self.restls_appdata_auth_hmac(true);
-        hmac_mask.update(sample_slice(
-            &record[RESTLS_APPDATA_OFFSET..][..data_len + padding_len],
-        ));
+        hmac_mask.update(sample_slice(&record[RESTLS_APPDATA_OFFSET..]));
         let mask = hmac_mask.finalize().into_bytes();
         record[RESTLS_APPDATA_LEN_OFFSET..][..2].copy_from_slice(&(data_len as u16).to_be_bytes());
 
@@ -275,22 +265,18 @@ impl<'a> RestlsState<'a> {
             &mut record[RESTLS_APPDATA_LEN_OFFSET..],
         );
         let mut hmac_auth = self.restls_appdata_auth_hmac(true);
-        hmac_auth.update(
-            &record[RESTLS_APPDATA_LEN_OFFSET..][..RESTLS_MASK_LEN + data_len + padding_len],
-        );
+        hmac_auth.update(&record[RESTLS_APPDATA_LEN_OFFSET..]);
         let auth = hmac_auth.finalize().into_bytes();
         record[5..5 + RESTLS_APPDATA_HMAC_LEN].copy_from_slice(&auth[..RESTLS_APPDATA_HMAC_LEN]);
         record[0..3].copy_from_slice(&[0x17, 0x3, 0x3]);
-        record[3..5].copy_from_slice(
-            &((data_len + padding_len + RESTLS_APPDATA_HMAC_LEN + RESTLS_MASK_LEN) as u16)
-                .to_be_bytes(),
-        );
+        let payload_len = (record.len() - 5) as u16;
+        record[3..5].copy_from_slice(&payload_len.to_be_bytes());
         debug!(
             "[{}]write_header: data_len {}, padding: {}, mask: {:?}, auth: {:?}
             to_server {}, to_client {}",
             self.id,
             data_len,
-            padding_len,
+            record.len() - RESTLS_APPDATA_OFFSET - data_len,
             &mask[..RESTLS_MASK_LEN],
             &auth[..RESTLS_APPDATA_HMAC_LEN],
             self.to_server_counter,
@@ -597,42 +583,49 @@ impl<'a> RestlsState<'a> {
         res
     }
 
+    fn prepare_packet_to_client(&mut self, out_buf: &mut DoubleCursorBuf) -> RestlsCommand {
+        let (data_len, padding_len, command) = self.act_according_to_script(out_buf.len());
+        out_buf.load(data_len + padding_len);
+        self.prepare_app_data_header(out_buf, data_len, command);
+        command
+    }
+
     async fn write_server_data_to_client(
         &mut self,
         inbound: &mut TLSStream,
-        out_buf: &mut [u8],
-        mut n: usize,
-    ) -> Result<()> {
-        let mut written = 0;
-        while written < n {
-            if (BUF_SIZE - written) < 1500 {
-                for i in 0..BUF_SIZE - written {
-                    out_buf[i] = out_buf[written + i];
-                }
-                n -= written;
-                written = 0;
-            }
-            let (new_written, packet_size) =
-                self.prepare_packet_to_client(&mut out_buf[written..], n - written);
+        out_buf: &mut DoubleCursorBuf,
+    ) -> Result<(u8, bool)> {
+        let mut write = 0;
+        while out_buf.len() > 0 {
+            let command = self.prepare_packet_to_client(out_buf);
+            assert!(out_buf.load_mut().len() > 0);
             inbound
                 .get_mut()
-                .write_all(&out_buf[written..][..packet_size])
+                .write_all(out_buf.load_mut())
                 .await
                 .context("inbound.write_all failed: ")?;
-            written += new_written;
+            out_buf.release();
+            write += 1;
+            match command {
+                RestlsCommand::Response(awaiting) => return Ok((write, awaiting > 0)),
+                _ => (),
+            }
         }
-        Ok(())
+        Ok((write, false))
     }
 
     async fn write_client_data_to_server(
         &mut self,
         inbound: &mut TLSStream,
         outbound: &mut TcpStream,
-        out_buf: &mut [u8],
     ) -> Result<WriteToServerResult> {
+        let mut need_respond = 0;
+        let mut read_record = 0;
         while inbound.codec().has_next() {
+            read_record += 1;
             let record = inbound.codec_mut().next_record()?;
             if record[0] == RECORD_ALERT {
+                debug!("[{}]record[0] == RECORD_ALERT", self.id);
                 return Ok(WriteToServerResult::MaybeCloseNotify);
             }
             let (record, command) = match self.read_app_data(record) {
@@ -643,6 +636,7 @@ impl<'a> RestlsState<'a> {
                     {
                         // this will probably be a close notify.
                         // we'll ignore it.
+                        debug!("[{}]maybe close notify {:?}", self.id, e);
                         Ok(WriteToServerResult::MaybeCloseNotify)
                     } else {
                         Err(e)
@@ -658,22 +652,12 @@ impl<'a> RestlsState<'a> {
             match command {
                 RestlsCommand::Noop => (),
                 RestlsCommand::Response(count) => {
-                    debug!("generating {} fake responses to client", count);
-                    for _ in 0..count {
-                        let (_, packet_size) = self.prepare_packet_to_client(out_buf, 0);
-                        inbound
-                            .get_mut()
-                            .write_all(&out_buf[..packet_size])
-                            .await
-                            .context(
-                                "write_client_data_to_server RestlsCommand::Response failed: ",
-                            )?;
-                    }
+                    need_respond += count;
                 }
             }
         }
         inbound.codec_mut().reset();
-        Ok(WriteToServerResult::Ok)
+        Ok(WriteToServerResult::Ok((read_record, need_respond)))
     }
 
     pub async fn copy_bidirectional(
@@ -681,23 +665,83 @@ impl<'a> RestlsState<'a> {
         inbound: &mut TLSStream,
         outbound: &mut TcpStream,
     ) -> Result<()> {
-        let mut out_buf = [0; BUF_SIZE];
+        let mut out_buf = DoubleCursorBuf::new();
+        let mut awaiting = false;
+        let mut need_respond = 0;
+        async fn read_if_has_capacity(
+            outbound: &mut TcpStream,
+            out_buf: &mut DoubleCursorBuf,
+        ) -> Result<usize> {
+            if out_buf.back_mut().len() > 0 {
+                Ok(outbound.read(out_buf.back_mut()).await?)
+            } else {
+                std::future::pending().await
+            }
+        }
         loop {
             select! {
                 res = self.read_from_stream(inbound) => {
                     res?;
-                    match self.write_client_data_to_server(inbound, outbound, &mut out_buf).await? {
+                    match self.write_client_data_to_server(inbound, outbound).await? {
                         WriteToServerResult::MaybeCloseNotify => return Ok(()),
-                        _ => (),
+                        WriteToServerResult::Ok((read, respond)) => {
+                            awaiting = read == 0;
+                            debug!("[{}]read {} and set awaiting to {}", self.id, read, awaiting);
+                            need_respond += respond;
+                        },
                     };
                 }
-                n = outbound.read(&mut out_buf[RESTLS_APPDATA_OFFSET..]) => {
+                n = read_if_has_capacity(outbound, &mut out_buf) => {
                     let n = n.context("outbound.read failed: ")?;
                     if n == 0 {
                         return Ok(());
                     }
-                    self.write_server_data_to_client(inbound, &mut out_buf, n).await?;
+                    out_buf.advance_back(n);
                 }
+            }
+
+            if (!awaiting || need_respond > 0) && out_buf.len() > 0 {
+                debug!(
+                    "[{}]writing to client: awaiting {}, need_respond {} ",
+                    self.id, awaiting, need_respond
+                );
+                let (write, new_awaiting) = self
+                    .write_server_data_to_client(inbound, &mut out_buf)
+                    .await?;
+                need_respond = if need_respond > write {
+                    need_respond - write
+                } else {
+                    0
+                };
+                awaiting = new_awaiting;
+                debug!(
+                    "[{}]data set awaiting to {}, pending {}",
+                    self.id,
+                    new_awaiting,
+                    out_buf.len()
+                );
+            }
+
+            if need_respond > 0 {
+                debug!("generating {} fake responses to client", need_respond);
+                assert!(out_buf.len() == 0);
+                for _ in 0..need_respond {
+                    let command = self.prepare_packet_to_client(&mut out_buf);
+                    inbound
+                        .get_mut()
+                        .write_all(out_buf.load_mut())
+                        .await
+                        .context("write_client_data_to_server RestlsCommand::Response failed: ")?;
+                    out_buf.release();
+                    match command {
+                        RestlsCommand::Response(count) => {
+                            debug!("[{}]fake response set awaiting to true", self.id);
+                            awaiting = count > 0;
+                        }
+                        _ => (),
+                    }
+                }
+                need_respond = 0;
             }
         }
     }
@@ -792,11 +836,12 @@ pub async fn start(options: Arc<Opt>) -> Result<()> {
             .await
             .context("failed to accept inbound stream")?;
         let options = options.clone();
+        stream.set_nodelay(true)?;
 
         tokio::spawn(async move {
             match handle(options, stream, counter).await {
                 Err(e) => tracing::debug!("[{}]{}", counter, e),
-                Ok(_) => (),
+                Ok(_) => debug!("[{}]closed", counter),
             }
         });
         counter += 1;
