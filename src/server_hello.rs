@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
+use tracing::debug;
 use std::io::Cursor;
 
 use crate::{
@@ -49,6 +50,7 @@ impl ServerHello {
 
         let mut server_random = [0; 32];
         buf.copy_to_slice(&mut server_random);
+        debug!("server random: {:?}", server_random);
         if server_random == HELLO_RETRY_RANDOM {
             return Err(anyhow!("reject: we don't allow a Hello Retry Request"));
         }

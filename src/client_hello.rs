@@ -112,6 +112,7 @@ impl ClientHello {
                 }
                 EXTENSION_KEY_SHARE => {
                     key_share = Self::read_key_share(buf);
+                    debug!("client key_share {:?}", key_share);
                 }
                 _ => {
                     skip_length_padded::<2, _>(buf);
