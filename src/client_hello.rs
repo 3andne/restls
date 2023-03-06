@@ -14,23 +14,12 @@ use crate::{
     },
 };
 
-pub(crate) struct SessionID {
-    session_id: [u8; 40],
-    len: usize,
-}
-
-impl SessionID {
-    pub fn get(&self) -> &[u8] {
-        &self.session_id[..self.len]
-    }
-}
-
 pub(crate) struct ClientHello {
     pub(crate) _client_random: [u8; 32],
-    pub(crate) session_id: SessionID,
+    pub(crate) session_id: [u8; 32],
     pub(crate) key_share: Vec<u8>,
     pub(crate) psk: Vec<u8>,
-    pub(crate) _session_ticket: Vec<u8>,
+    pub(crate) session_ticket: Vec<u8>,
 }
 
 impl ClientHello {
@@ -93,14 +82,10 @@ impl ClientHello {
         buf.advance(3); // len
         buf.advance(2); // version
         buf.copy_to_slice(&mut _client_random); // client random
-        let mut session_id = SessionID {
-            session_id: [0; 40],
-            len: 0,
-        };
 
-        let session_id_len = read_length_padded::<1, _>(buf, &mut session_id.session_id); // session id
-        session_id.len = session_id_len;
-        debug!("session id: {:?}", session_id.get());
+        let mut session_id = [0; 32];
+        let session_id_len = read_length_padded::<1, _>(buf, &mut session_id)?; // session id
+        debug!("session id: {:?}", session_id);
         if session_id_len != REQUIRED_SESSION_ID_LEN {
             return Err(anyhow!("reject: session id should be exactly 32 bytes"));
         }
@@ -127,6 +112,7 @@ impl ClientHello {
                 }
                 EXTENSION_KEY_SHARE => {
                     key_share = Self::read_key_share(buf);
+                    debug!("client key_share {:?}", key_share);
                 }
                 _ => {
                     skip_length_padded::<2, _>(buf);
@@ -141,7 +127,7 @@ impl ClientHello {
             session_id,
             key_share,
             psk,
-            _session_ticket: session_ticket,
+            session_ticket,
         })
     }
 }

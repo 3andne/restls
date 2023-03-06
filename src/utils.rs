@@ -1,19 +1,18 @@
 use anyhow::{anyhow, Result};
 use bytes::Buf;
 use futures_util::StreamExt;
+use rand::Rng;
 use std::{
     cmp::min,
     io::{self, Cursor},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    select,
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, select};
 use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
+
+use crate::common::{BUF_SIZE, RESTLS_APPDATA_OFFSET};
 
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
 
@@ -81,22 +80,36 @@ impl TLSCodec {
         5 + ((self.buf[self.cursor + 3] as usize) << 8 | self.buf[self.cursor + 4] as usize)
     }
 
-    pub fn next_record(&mut self) -> &mut [u8] {
-        let start = self.cursor;
-        self.cursor += self.peek_record_length();
-        &mut self.buf[start..self.cursor]
-    }
-
-    pub fn peek_record(&self) -> &[u8] {
-        let len = self.peek_record_length();
-        &self.buf[self.cursor..self.cursor + len]
-    }
-    pub fn peek_record_type(&self) -> Result<u8> {
+    fn check_codec_failure(&self) -> Result<()> {
         if !self.enable_codec {
             Err(anyhow!("codec disabled due to invalid record"))
         } else {
-            Ok(self.buf[self.cursor])
+            Ok(())
         }
+    }
+
+    pub fn next_record(&mut self) -> Result<&mut [u8]> {
+        self.check_codec_failure()?;
+        let start = self.cursor;
+        self.cursor += self.peek_record_length();
+        Ok(&mut self.buf[start..self.cursor])
+    }
+
+    pub fn peek_record(&self) -> Result<&[u8]> {
+        self.check_codec_failure()?;
+        let len = self.peek_record_length();
+        Ok(&self.buf[self.cursor..self.cursor + len])
+    }
+
+    pub fn peek_record_mut(&mut self) -> Result<&mut [u8]> {
+        self.check_codec_failure()?;
+        let len = self.peek_record_length();
+        Ok(&mut self.buf[self.cursor..self.cursor + len])
+    }
+
+    pub fn peek_record_type(&self) -> Result<u8> {
+        self.check_codec_failure()?;
+        Ok(self.buf[self.cursor])
     }
 
     pub fn has_next(&self) -> bool {
@@ -182,11 +195,16 @@ pub(crate) fn skip_length_padded<const N: usize, T: Buf>(buf: &mut T) -> usize {
     len
 }
 
-pub(crate) fn read_length_padded<const N: usize, T: Buf>(buf: &mut T, copy_to: &mut [u8]) -> usize {
+pub(crate) fn read_length_padded<const N: usize, T: Buf>(
+    buf: &mut T,
+    copy_to: &mut [u8],
+) -> Result<usize> {
     let len = read_length_padded_header::<N, T>(buf);
-    assert!(copy_to.len() >= len);
+    if copy_to.len() < len {
+        return Err(anyhow!("truncated length padded content"));
+    }
     buf.copy_to_slice(&mut copy_to[..len]);
-    len
+    Ok(len)
 }
 
 pub(crate) fn extend_from_length_prefixed<const N: usize, T: Buf>(
@@ -222,51 +240,10 @@ pub(crate) fn xor_bytes(secret: &[u8], msg: &mut [u8]) {
     }
 }
 
-pub async fn copy_bidirectional(
-    mut inbound: TLSStream,
-    mut outbound: TcpStream,
-    mut content_offset: usize,
-) -> Result<()> {
-    let mut out_buf = [0; 0x2000];
-    out_buf[..3].copy_from_slice(&[0x17, 0x03, 0x03]);
-    while inbound.codec().has_next() {
-        outbound
-            .write_all(&inbound.codec_mut().next_record()[content_offset..])
-            .await?;
-        content_offset = 5;
-    }
-
-    inbound.codec_mut().reset();
-
-    loop {
-        select! {
-            res = inbound.next() => {
-                match res {
-                    Some(Ok(_)) => (),
-                    None => {
-                        return Ok(());
-                    }
-                    Some(Err(e)) => {
-                        return Err(e);
-                    }
-                }
-                while inbound.codec().has_next() {
-                    outbound
-                        .write_all(&inbound.codec_mut().next_record()[5..])
-                        .await?;
-                }
-                inbound.codec_mut().reset();
-            }
-            n = outbound.read(&mut out_buf[5..]) => {
-                let n = n?;
-                if n == 0 {
-                    return Ok(());
-                }
-                out_buf[3..5].copy_from_slice(&(n as u16).to_be_bytes());
-                inbound.get_mut().write_all(&out_buf[..n+5]).await?;
-            }
-        }
-    }
+pub async fn tcp_rst(stream: &mut TcpStream) -> Result<()> {
+    stream.set_linger(Some(Duration::from_secs(0)))?;
+    stream.shutdown().await?;
+    return Ok(());
 }
 
 pub async fn copy_bidirectional_fallback(
@@ -319,18 +296,16 @@ pub async fn copy_bidirectional_fallback(
                 match res {
                     Some(Ok(_)) => (),
                     Some(Err(root_cause)) => {
-                        match root_cause.downcast_ref::<io::Error>() {
+                        return match root_cause.downcast_ref::<io::Error>() {
                             Some(e) => {
                                 match e.kind() {
                                     io::ErrorKind::ConnectionReset => {
-                                        inbound.get_mut().set_linger(Some(Duration::from_secs(0)))?;
-                                        inbound.get_mut().shutdown().await?;
-                                        return Ok(());
+                                        tcp_rst(inbound.get_mut()).await
                                     }
-                                    _ => return Err(root_cause),
+                                    _ => Err(root_cause),
                                 }
                             },
-                            None => return Err(root_cause),
+                            None => Err(root_cause),
                         }
                     }
                     None => {
@@ -342,5 +317,205 @@ pub async fn copy_bidirectional_fallback(
                 inbound.get_mut().write_all(outbound.codec().raw_buf()).await?;
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RestlsCommand {
+    Noop,
+    Response(u8),
+}
+
+impl RestlsCommand {
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        match buf[0] {
+            0 => Self::Noop,
+            1 => Self::Response(buf[1]),
+            _ => unimplemented!("unsupported command type"),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 2] {
+        match self {
+            Self::Noop => [0, 0],
+            Self::Response(count) => [1, *count],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TargetLen(u16, u16);
+
+fn parse_int(cursor: &mut Cursor<&[u8]>) -> u16 {
+    let mut res = 0;
+    let len = cursor.chunk().len();
+    let mut i = 0;
+    while i < len {
+        let b = cursor.chunk()[i];
+        if b <= b'9' && b >= b'0' {
+            res = res * 10 + (cursor.chunk()[i] - b'0') as u32;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    assert!(res < u16::MAX as u32);
+    cursor.advance(i);
+    res as u16
+}
+
+impl TargetLen {
+    fn from_bytes(cursor: &mut Cursor<&[u8]>) -> Self {
+        let base = parse_int(cursor);
+        if !cursor.has_remaining() {
+            return Self(base, 0);
+        }
+        match cursor.chunk()[0] {
+            b'~' => {
+                cursor.advance(1);
+                Self(base, parse_int(cursor))
+            }
+            b'?' => {
+                cursor.advance(1);
+                let rng = parse_int(cursor);
+                assert!((rng as u32) + (base as u32) < u16::MAX as u32);
+                let new_base = base + rand::thread_rng().gen_range(0..rng);
+                Self(new_base, 0)
+            }
+            _ => Self(base, 0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        if self.1 == 0 {
+            self.0 as usize
+        } else {
+            (self.0 + rand::thread_rng().gen_range(0..self.1)) as usize
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Line {
+    target_len: TargetLen,
+    pub command: RestlsCommand,
+}
+
+impl Line {
+    pub fn len(&self) -> usize {
+        self.target_len.len()
+    }
+
+    pub fn from_str(line_raw: &str) -> Self {
+        let mut c = Cursor::new(line_raw.as_bytes());
+        let target_len = TargetLen::from_bytes(&mut c);
+        if !c.has_remaining() {
+            return Self {
+                target_len,
+                command: RestlsCommand::Noop,
+            };
+        }
+        match c.get_u8() {
+            b'<' => {
+                let response_count = parse_int(&mut c);
+                assert!(
+                    !c.has_remaining(),
+                    "unexpected content in restls command {:?}",
+                    String::from_utf8(c.chunk().to_vec()).unwrap()
+                );
+                assert!(
+                    response_count < 255,
+                    "too many response in restls script, expect < 255, actual {}",
+                    response_count
+                );
+                return Self {
+                    target_len,
+                    command: RestlsCommand::Response(response_count as u8),
+                };
+            }
+            _ => unimplemented!("unsupported command in restls script"),
+        }
+    }
+}
+
+pub struct DoubleCursorBuf {
+    inner: [u8; BUF_SIZE],
+    front_cursor: usize,
+    back_cursor: usize,
+    load_len: usize,
+}
+
+impl DoubleCursorBuf {
+    pub fn new() -> Self {
+        Self {
+            inner: [0; BUF_SIZE],
+            front_cursor: 0,
+            back_cursor: RESTLS_APPDATA_OFFSET,
+            load_len: 0,
+        }
+    }
+
+    fn shift_to_head(&mut self) {
+        if self.front_cursor == 0 {
+            return;
+        }
+        unsafe {
+            std::ptr::copy(
+                self.inner[self.front_cursor..].as_ptr(),
+                self.inner.as_mut_ptr(),
+                self.back_cursor - self.front_cursor,
+            );
+        }
+        self.back_cursor -= self.front_cursor;
+        self.front_cursor = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.back_cursor - self.front_cursor - RESTLS_APPDATA_OFFSET
+    }
+
+    pub fn load_mut(&mut self) -> &mut [u8] {
+        &mut self.inner
+            [self.front_cursor..self.front_cursor + RESTLS_APPDATA_OFFSET + self.load_len]
+    }
+
+    pub fn release(&mut self) {
+        self.front_cursor += self.load_len;
+        self.load_len = 0;
+        if self.front_cursor + RESTLS_APPDATA_OFFSET == self.back_cursor {
+            self.reset()
+        }
+    }
+
+    pub fn load(&mut self, len: usize) {
+        assert!(self.load_len == 0);
+        if len > self.len() {
+            if self.inner.len() - self.front_cursor < 1500 {
+                self.shift_to_head();
+            }
+            let padding_len = len - self.len();
+            rand::thread_rng()
+                .fill(&mut self.inner[self.back_cursor..self.back_cursor + padding_len]);
+            self.back_cursor += padding_len;
+            assert!(self.back_cursor < self.inner.len());
+        }
+        self.load_len = len;
+    }
+
+    pub fn reset(&mut self) {
+        self.front_cursor = 0;
+        self.back_cursor = RESTLS_APPDATA_OFFSET;
+    }
+
+    pub fn back_mut(&mut self) -> &mut [u8] {
+        if self.inner.len() - self.back_cursor < 1500 {
+            self.shift_to_head()
+        }
+        &mut self.inner[self.back_cursor..]
+    }
+
+    pub fn advance_back(&mut self, len: usize) {
+        assert!(self.back_cursor + len <= self.inner.len());
+        self.back_cursor += len;
     }
 }

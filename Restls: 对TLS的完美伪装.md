@@ -1,4 +1,4 @@
-# Restls - 对TLS握手的完美伪装
+# Restls - 对TLS的完美伪装
 
 `作者: 3andne`
 
@@ -10,7 +10,7 @@
 1. 根据代理产生的流量行为 - 大流量、长连接、trojan连接建立后模式确定的TLS握手等
 2. 根据伪装站的特征 - 往往使用便宜或免费的域名，使用由let's encrypt签发的免费证书
 
-针对第二个问题（简称白名单），@ihciah提供了ShadowTLS作为解决方案。
+针对第二个问题（简称白名单），[@ihciah](https://github.com/ihciah)提供了[ShadowTLS](https://github.com/ihciah/shadow-tls)作为解决方案。
 
 ## ShadowTLS简介
 
@@ -37,7 +37,7 @@ ShadowTLS服务器本身没有域名，没有证书，它的目的是把自己�
     [Data]           <---->       [DATA]         <----> Shadowsocks Server
 ```
 
-## ShadowTLS的问题
+## ShadowTLS-V2的问题
 
 ShadowTLS为解决白名单提供了一个宝贵的思路，但协议本身存在无法忽视的问题，即协议仅设计了针对客户端的认证，没有针对服务端的认证，根据所@CoiaPrant233指出：
 ```
@@ -55,15 +55,26 @@ ShadowTLS协议握手过程并未提供服务端的认证，只能认定服务�
 4. 观察在TLS握手之后，服务器会不会发送Alert或直接reset connection
 5. 重复多次，确认代理服务器的身份
 
-## Restls
+截止本文修改时，ShadowTLS已经迭代至[v3](https://github.com/ihciah/shadow-tls/blob/master/docs/protocol-v3-en.md)，实现了对TLS 1.3的双向认证，由于设计目标限制，[ShadowTLS未能对TLS1.2实现双向认证](https://github.com/ihciah/shadow-tls/issues/69#issue-1581106610)。
 
-为了解决ShadowTLS上述的问题（无法提供双向认证），我们设计了Restls协议，意为Restless，希望该协议可以让防火墙设计者们坐立不安。本协议兼容主流的TLS1.2和TLS1.3，可以将服务器伪装成任何一个白名单内网站，在TLS握手的同时，秘密进行客户端和服务端的双向认证，认证过程完全不引入新的特征，实现对TLS握手的完美伪装*。
+在目前所有致力于解决白名单封锁的协议中，只有Restls可以覆盖TLS全版本。
+
+## Restls-V1
+
+为了解决ShadowTLS V2上述的问题（无法提供双向认证），我们设计了Restls协议，意为Restless，**希望该协议可以让防火墙设计者们坐立不安**。  
+
+Restls的设计目标为：
+
+1. 兼容所有主流TLS版本(TLS1.2, TLS1.3)，可以将服务器伪装成任何一个白名单内网站。
+2. 在TLS握手的同时，秘密进行客户端和服务端的双向认证，认证过程完全不引入新的特征。
+3. 握手结束后，继续将代理流量伪装为普通TLS流量，防御基于包长和收发模式的流量分析，[防御篡改、重放、丢包等主动攻击](#应用数据传输认证).
+4. 为客户端提供`ClientHello`伪装的能力，[将TLS指纹伪装成浏览器](https://github.com/3andne/restls-client-go)。
+
+Restls希望在满足上述目标的同时提供高性能，但极致性能并不是我们的设计目标。
 
 restls server: https://github.com/3andne/restls  
 restls client (a fork of clash.meta): https://github.com/3andne/Clash.Meta  
 restls tls library (client-side): https://github.com/3andne/restls-client-go  
-
-*: Restls（以及ShadowTLS）仅关注对握手流程的完美伪装，暂未关注诸如ClientHello指纹等问题，这会是我们下一步的工作。
 
 ### Overview
 
@@ -93,9 +104,11 @@ Restls over TLS 1.3 or TLS 1.2 with resumption
      try_decrypt(UndoRestlsServerAuth)
       > succeeded
      {Finished}      
-     [HMAC_5 | Data] ----->     {Finished}      ----->
-                                (observe HMAC_5)
-                     <---->     [Data]          <---->   Shadowsocks Server
+     [AUTH_C_0|Data] ----->     {Finished}      ----->
+                                [Data]          ----->   Shadowsocks Server
+     [Data]          <-----     [AUTH_S | Data] <-----   Shadowsocks Server
+     [AUTH_C | Data] ----->     [Data]          ----->   Shadowsocks Server
+                                ....
 ```
 
 Restls over TLS 1.2:
@@ -122,7 +135,9 @@ Restls over TLS 1.2:
                      <-----      RestlsServerAuth
      try_decrypt(UndoRestlsServerAuth)
       > succeeded
-     {Data}          <---->        (Relay)      <---->  Shadowsocks Server
+     [AUTH_C | Data] ----->      [Data]          ----->  Shadowsocks Server
+     [Data]          <-----      [AUTH_S | Data] <-----  Shadowsocks Server
+                                    ....
 ```
 
 
@@ -297,10 +312,55 @@ Restls只对认证过的客户端发送`RestlsServerAuth`，对于没有认证�
 需要注意的是，`RestlsServerAuth`所依赖的包（`Finished`、`{EncryptedExtensions}`）往往有特定的长度，因此将server认证字段插入包内可能会产生全新特征，因此Restls采用了`xor`的方式来添加认证字段。
 * 使用`xor`在避免产生特征的同时，增加了实现难度。一些加密算法的实现是有状态的，一旦解密失败便无法恢复，一个比较简单的解决方案是准备两个状态相同的`cipher object`，用以替换。
 
-### 客户端二次认证
+### 应用数据传输认证
 
-在TLS 1.2 resumption以及TLS 1.3中，`ClientFinished`是握手过程中的最后一个强制环节，客户端使用该record来证明自己拥有对应的私钥，但TLS server在收到`ClientFinished`后，不会向client发送确认的record，因此Restls无法通过握手的流程确认`ClientFinished`是否有问题，Restls服务器或许可以等待一段时间看TLS服务器是否返回`TLS Alert Record`，但这段时间具体该多长并不是一个容易决定的问题，显然这不是一个优雅的解决方案。因此，类似于`ShadowTLS`中的方案，Restls客户端需要在之后的第一个`Application Data Record`头部插入一个认证字段，来表明自身的身份。
+Restls应用数据是TLS握手之后传输的数据，这些数据也是真正的代理数据。
+在早期的设计中，Restls只参与TLS握手环节并为后续应用数据提供简单的伪装，这为主动攻击留下了空间。
+在Restls-V1中，我们受[ShadowTLS-V3](https://github.com/ihciah/shadow-tls/blob/master/docs/protocol-v3-en.md)的启发并设计了`restls_auth_header`来实现对应用数据的保护。
 
+```
+Restls Application Data:
+
++----------------+------------------------+----------+-----------+
+|   TLS_HEADER   |   RESTLS_AUTH_HEADER   |   DATA   |  PADDING  |
++----------------+------------------------+----------+-----------+
+|        5       |           12           |    VAR   |    VAR    |
++----------------+------------------------+----------+-----------+
+
+|---------------------- restls_auth_header -----------------------|
++---------------+---------------------+---------------------------+
+|   AUTH_HMAC   |   MASKED_DATA_LEN   |   MASKED_RESTLS_COMMAND   |
++---------------+---------------------+---------------------------+
+|       8       |          2          |             2             |
++---------------+---------------------+---------------------------+
+```
+
+`restls_auth_header`需要被添加在客户端和服务端发送的所有应用数据record之中，我们将依次介绍它的各个部分。
+
+#### AUTH_HMAC
+
+Restls通过`AUTH_HMAC`为数据传输提供有上下文的完整性保护，使得Restls可以察觉篡改、丢失以及重放等攻击。
+
+在TLS 1.2 resumption以及TLS 1.3中，`ClientFinished`是握手过程中的最后一个强制环节，客户端使用该record来证明自己拥有对应的私钥，但TLS server在收到`ClientFinished`后，不会向client发送确认的record。
+
+为了让Restls可以确认`ClientFinished`是否完好，我们要求在这两种情况下，客户端发送的第一个AUTH_HMAC包含`ClientFinished`的信息。
+
+#### MASKED_DATA_LEN
+
+`data_len`即本record中包含的data的实际长度。通过记录这个长度，Restls可以为record添加padding，为防御流量分析提供可能
+
+明文`data_len`显然不宜直接传输，因此Restls使用xor对其进行加密。具体导出方式请见下文。
+
+#### MASKED_RESTLS_COMMAND
+
+`restls_command`是一系列用来要求通信对方做出相应反应的命令。  
+Restls-V1 支持两种Command，分别是：
+1. Noop. 即不需要任何反应
+2. Response(num). 对方需要发送`num`数量的response。
+
+与`data_len`一样，`restls_command`被使用xor进行加密之后再进行传输。
+
+#### 流程
 
 TLS 1.3 or TLS 1.2 resumption
 ```
@@ -323,11 +383,54 @@ TLS 1.3 or TLS 1.2 resumption
      try_decrypt(UndoRestlsServerAuth)
       > succeeded
      {Finished}      
-     [HMAC_5 | Data] ----->     {Finished}      ----->
-                                (observe HMAC_5)
-                     <---->     [Data]          <---->   Shadowsocks Server
+     [AUTH_C_0 | Data] ----->   [Data]          ----->  Shadowsocks Server
+     [Data]            <-----   [AUTH_S | Data] <-----  Shadowsocks Server
+     [AUTH_C | Data]   ----->   [Data]          ----->  Shadowsocks Server
 where
-HMAC_5 = HMAC(ServerRandom | ServerRandom)
+HMAC_C(...) = HMAC(ServerRandom | TO_SERVER_MAGIC | TO_SERVER_COUNTER | ...)
+MASKED_DATA_LEN = DATA_LEN ^ HMAC_C(Data[:min(len(Data), 32)])[:2]
+MASKED_RESTLS_COMMAND = RESTLS_COMMAND ^ HMAC_C(Data[:min(len(Data), 32)])[2:4]
+
+AUTH_HMAC_C_0 = HMAC_C(ClientFinished | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND | Data)
+AUTH_C_0 = AUTH_HMAC_C_0 | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND
+
+AUTH_HMAC_C = HMAC_C(MASKED_DATA_LEN | MASKED_RESTLS_COMMAND | Data)
+AUTH_C =  AUTH_HMAC_C | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND
+
+HMAC_S(...) = HMAC(ServerRandom | TO_CLIENT_MAGIC | TO_CLIENT_COUNTER | ...)
+AUTH_HMAC_S = HMAC_S(MASKED_DATA_LEN | MASKED_RESTLS_COMMAND | Data)
+AUTH_S =  AUTH_HMAC_S | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND
+```
+
+TLS 1.2:
+```
+`{}` means encrypted.
+
+    Restls Client               Restls Server          example.com Server
+
+     ClientHello     ----->        (Relay)      ----->
+      +restls_client_auth                               ServerHello
+                                                        Certificate*
+                                                        ServerKeyExchange*
+                                                        CertificateRequest*
+                     <-----        (Relay)      <-----  ServerHelloDone   
+     Certificate*
+     ClientKeyExchange
+     CertificateVerify*
+     [ChangeCipherSpec]
+     Finished        ----->        
+                            (verify client pub key)
+                                   (Relay)      ----->  [ChangeCipherSpec]
+                                                <-----  Finished
+                                 [ChangeCipherSpec]
+                     <-----      RestlsServerAuth
+     try_decrypt(UndoRestlsServerAuth)
+      > succeeded
+     [AUTH_C | Data] ----->      [Data]          ----->  Shadowsocks Server
+     [Data]          <-----      [AUTH_S | Data] <-----  Shadowsocks Server
+                                    ....
+where
+AUTH_C and AUTH_S is defined above
 ```
 
 ### 补充
