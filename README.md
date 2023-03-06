@@ -1,12 +1,18 @@
 # Restls
 
-A protocol to disguise your proxy traffic as normal TLS traffic.  
+A protocol that can disguise your proxy traffic as regular TLS traffic:
 
-For more details regarding how restls parrots any tls site:  
-[Restls: A Perfect Impersonation of TLS Handshake](./Restls%3A%20A%20Perfect%20Impersonation%20of%20TLS.md)
+* Disguise your proxy server [as any TLS server](./Restls%3A%20A%20Perfect%20Impersonation%20of%20TLS.md), such as `microsoft.com`.
+* Developed based on [utls](https://github.com/refraction-networking/utls), Disguise your [proxy client](https://github.com/3andne/Clash.Meta#restls) as a normal browser.
+* Use the `Restls-Script` protocol to conceal your proxy behavior and break characteristics such as "TLS in TLS".
 
-如果你想知道Restls是如何伪装成任何一个TLS网站的，请阅读：   
-[Restls: 对TLS的完美伪装](./Restls%3A%20%E5%AF%B9TLS%E7%9A%84%E5%AE%8C%E7%BE%8E%E4%BC%AA%E8%A3%85.md)
+---
+
+一个可以把你的代理流量伪装成普通TLS流量的协议：
+
+* 把你的代理服务器[伪装成任何一个TLS服务器](./Restls%3A%20%E5%AF%B9TLS%E7%9A%84%E5%AE%8C%E7%BE%8E%E4%BC%AA%E8%A3%85.md)，例如`microsoft.com`。
+* 基于[utls](https://github.com/refraction-networking/utls)开发，把你的[代理客户端](https://github.com/3andne/Clash.Meta#restls)伪装成一个普通的浏览器。
+* 使用Restls「剧本」协议，隐藏你的代理行为，破坏"TLS in TLS"等特征。
 
 ## Hide Your Proxy Traffic Behavior
 
