@@ -1,4 +1,4 @@
-# Restls: A Perfect Impersonation of TLS Handshake
+# Restls: A Perfect Impersonation of TLS
 
 `Authored by: 3andne`
 
@@ -11,11 +11,11 @@ At the end of 2022, after the latest round of upgrades, the firewall began block
 1. Based on the traffic behavior of a proxy client - high traffic, long connection, pattern of TLS handshake after the Trojan connection is established, etc.
 2. Based on the characteristics of the disguised website - often using cheap or free domains and using free certificates issued by let's encrypt.
 
-Regarding the second issue (referred to as the whitelist), @ihciah provided ShadowTLS as a solution.
+Regarding the second issue (referred to as the allowlist), [@ihciah](https://github.com/ihciah) provided [ShadowTLS](https://github.com/ihciah/shadow-tls) as a solution.
 
 ## ShadowTLS
 
-ShadowTLS server itself does not have a domain or certificate, its purpose is to disguise itself as a mainstream (in-whitelist) website.
+ShadowTLS server itself does not have a domain or certificate, its purpose is to disguise itself as a mainstream (in-allowlist) website.
 
 In order to achieve this goal (taking the example of disguising as `example.com`), the client needs to send a TLS handshake request to the server. The server then forwards the request directly to `example.com` and returns the response to the client. In the eyes of the GFW, the proxy server can complete the handshake to `example.com`, so the proxy server is `example.com`.
 
@@ -38,9 +38,9 @@ After the handshake is complete, the client will start sending the real packets 
     [Data]           <---->       [DATA]         <----> Shadowsocks Server
 ```
 
-## The Issues of ShadowTLS
+## The Issues of ShadowTLS-V2
 
-ShadowTLS provides a valuable solution for whitelist circumvention, but the protocol itself has significant issues, as it only provides client authentication and not server authentication. As pointed out by @CoiaPrant233:
+ShadowTLS provides a valuable solution for allowlist circumvention, but the protocol itself has significant issues, as it only provides client authentication and not server authentication. As pointed out by @CoiaPrant233:
 
 ```
 Browser --> Real TLS server ✅
@@ -59,15 +59,29 @@ According to @CoiaPrant233's ideas, firewalls can detect ShadowTLS as follows:
 4. Observe whether the server sends an Alert or resets the connection after the TLS handshake
 5. Repeat multiple times to confirm the assumption.
 
-## Restls
+As of the time of this article's revision, ShadowTLS has iterated to [v3](https://github.com/ihciah/shadow-tls/blob/master/docs/protocol-v3-en.md) and achieved mutual authentication for TLS 1.3. Due to design limitations, [ShadowTLS was unable to implement mutual authentication for TLS 1.2](https://github.com/ihciah/shadow-tls/issues/69#issue-1581106610).
 
-To address the issue of ShadowTLS not providing two-way authentication, we have designed the Restls protocol, which stands for restless, with the hope that it will keep GFW designers restless. This protocol is compatible with TLS1.2 and TLS1.3 and can disguise the server as any website in the whitelist. During the TLS handshake, it secretly performs two-way authentication between the client and server. The authentication process introduces no new characteristics and achieves a perfect impersonation of the TLS handshake.*
+**Among all protocols dedicated to allowlist circumvention, only Restls supports all active versions of TLS.**
+
+## Restls-V1
+
+To address the issue of ShadowTLS-V2 not providing two-way authentication, we have designed the Restls protocol, which **stands for restless, with the hope that it will keep GFW designers restless**. 
+
+The design goals of Restls-V1 are:
+
+1. Compatibility with all mainstream TLS versions (TLS1.2, TLS1.3), allowing the server to impersonate any website on a allowlist.
+2. Perform mutual authentication during the TLS handshake, with no introduction of new characteristics in the authentication process.
+3. After the handshake, continue to disguise proxy traffic as ordinary TLS traffic.
+   1. Defend against [traffic analysis based on packet length and transmission patterns](./Restls-Script:%20Hide%20Your%20Proxy%20Traffic%20Behavior.md).
+   2. Defend against [active attacks such as tampering, replay, and packet loss](#application-data-transmission-authentication).
+4. Provide clients with the ability to [parrot a browser's TLS fingerprint](https://github.com/3andne/restls-client-go).
+
+While aiming for high performance, achieving ultimate performance is not our design goal.
 
 restls server: https://github.com/3andne/restls  
 restls client (a fork of clash.meta): https://github.com/3andne/Clash.Meta  
 restls tls library (client-side): https://github.com/3andne/restls-client-go  
 
-*Restls (as well as ShadowTLS) only targets the handshake process, and has not yet addressed issues such as the ClientHello fingerprinting. We'll work on that later.
 
 ### Overview
 
@@ -97,9 +111,11 @@ Restls over TLS 1.3 or TLS 1.2 with resumption
      try_decrypt(UndoRestlsServerAuth)
       > succeeded
      {Finished}      
-     [HMAC_5 | Data] ----->     {Finished}      ----->
-                                (observe HMAC_5)
-                     <---->     [Data]          <---->   Shadowsocks Server
+     [AUTH_C_0|Data] ----->     {Finished}      ----->
+                                [Data]          ----->   Shadowsocks Server
+     [Data]          <-----     [AUTH_S | Data] <-----   Shadowsocks Server
+     [AUTH_C | Data] ----->     [Data]          ----->   Shadowsocks Server
+                                ....
 ```
 
 Restls over TLS 1.2:
@@ -126,7 +142,9 @@ Restls over TLS 1.2:
                      <-----      RestlsServerAuth
      try_decrypt(UndoRestlsServerAuth)
       > succeeded
-     {Data}          <---->        (Relay)      <---->  Shadowsocks Server
+     [AUTH_C | Data] ----->      [Data]          ----->  Shadowsocks Server
+     [Data]          <-----      [AUTH_S | Data] <-----  Shadowsocks Server
+                                    ....
 ```
 
 ### Client Authentication
@@ -302,11 +320,59 @@ It is worth noting that the packages (`Finished` or `EncryptedExtensions`) upon 
 
 Using XOR makes implementation more difficult, since some ciphers have state-based implementations and cannot be recovered once decryption fails. A relatively simple workaround is to prepare another cipher objects with the identical state as a fallback in case of a decryption failure.
 
-### Client Re-authentication
+### Application Data Transmission Authentication
 
-In TLS 1.2 resumption and TLS 1.3, `ClientFinished` is the last compulsory step in the handshake process, where the client uses the record to prove that it possesses the corresponding private key. However, the TLS server does not send a confirmation record to the client after receiving the "ClientFinished". Thus, Restls cannot confirm through the handshake process whether `ClientFinished` is problematic. The Restls server may wait for a period of time to see if the TLS server sends a `TLS Alert Record`, but how long this period should be is not an easy decision to make, and this clearly is not an elegant solution. Therefore, similar to the approach in `ShadowTLS`, the Restls client needs to insert an authentication field in the header of the first `Application Data Record` after the handshake to indicate its identity.
+`Restls application data` refers to the data transmitted after the TLS handshake, which is the actual proxy data.
 
-Restls over TLS 1.3 or TLS 1.2 resumption
+In the early design, Restls only participated in the TLS handshake and provided simple disguising for subsequent application data, which left room for active attacks.
+
+In Restls-V1, we drew inspiration from [ShadowTLS-V3](https://github.com/ihciah/shadow-tls/blob/master/docs/protocol-v3-en.md) and designed the `restls_auth_header` to protect the application data.
+
+```
+Restls Application Data:
+
++----------------+------------------------+----------+-----------+
+|   TLS_HEADER   |   RESTLS_AUTH_HEADER   |   DATA   |  PADDING  |
++----------------+------------------------+----------+-----------+
+|        5       |           12           |    VAR   |    VAR    |
++----------------+------------------------+----------+-----------+
+
+|---------------------- restls_auth_header -----------------------|
++---------------+---------------------+---------------------------+
+|   AUTH_HMAC   |   MASKED_DATA_LEN   |   MASKED_RESTLS_COMMAND   |
++---------------+---------------------+---------------------------+
+|       8       |          2          |             2             |
++---------------+---------------------+---------------------------+
+```
+
+The `restls_auth_header` needs to be added to all `Restls application data` records sent by the client and server. We will introduce its various parts in order.
+
+#### AUTH_HMAC
+
+Restls provides context-aware integrity protection for data transmission through `AUTH_HMAC`, enabling it to detect attacks such as tampering, loss, and replay.
+
+In TLS 1.2 resumption and TLS 1.3, `ClientFinished` is the last mandatory step in the handshake process. The client uses this record to prove that it possesses the corresponding private key. However, the TLS server does not send a confirmation record to the client after receiving `ClientFinished`. 
+
+In order for Restls to verify whether `ClientFinished` is intact, we require that the first AUTH_HMAC packet sent by the client in these two scenarios includes information about `ClientFinished`.
+
+#### MASKED_DATA_LEN
+
+`data_len` refers to the actual length of the data contained in this record. By recording this length, Restls can add padding to the record to defend traffic analysis.
+
+It is not appropriate to transmit data_len in plaintext, so Restls uses XOR encryption to mask it. The specific derivation method will be explained in the following text.
+
+#### MASKED_RESTLS_COMMAND
+
+`restls_command` is a series of commands used to request a corresponding response from the peer.
+
+Restls-V1 supports two types of commands:
+
+1. `Noop`. No response is required.
+2. `Response(num)`. The peer needs to send `num` responses.
+
+Like `data_len`, `restls_command` is masked using XOR before being transmitted.
+
+TLS 1.3 or TLS 1.2 resumption
 ```
 `{}` means encrypted.
 
@@ -327,9 +393,59 @@ Restls over TLS 1.3 or TLS 1.2 resumption
      try_decrypt(UndoRestlsServerAuth)
       > succeeded
      {Finished}      
-     [HMAC_5 | Data] ----->     {Finished}      ----->
-                                (observe HMAC_5)
-                     <---->     [Data]          <---->   Shadowsocks Server
+     [AUTH_C_0 | Data] ----->   [Data]          ----->  Shadowsocks Server
+     [Data]            <-----   [AUTH_S | Data] <-----  Shadowsocks Server
+     [AUTH_C | Data]   ----->   [Data]          ----->  Shadowsocks Server
+
 where
-HMAC_5 = HMAC(ServerRandom | ServerRandom)
+HMAC_C(...) = HMAC(ServerRandom | TO_SERVER_MAGIC | TO_SERVER_COUNTER | ...)
+MASK_C = HMAC_C((Data | Padding)[:min(len(Data | Padding), 32)])
+MASKED_DATA_LEN = DATA_LEN ^ MASK_C[:2]
+MASKED_RESTLS_COMMAND = RESTLS_COMMAND ^ MASK_C[2:4]
+
+AUTH_HMAC_C_0 = HMAC_C(ClientFinished | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND | Data | Padding)
+AUTH_C_0 = AUTH_HMAC_C_0 | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND
+
+AUTH_HMAC_C = HMAC_C(MASKED_DATA_LEN | MASKED_RESTLS_COMMAND | Data | Padding)
+AUTH_C =  AUTH_HMAC_C | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND
+
+HMAC_S(...) = HMAC(ServerRandom | TO_CLIENT_MAGIC | TO_CLIENT_COUNTER | ...)
+MASK_S = HMAC_S((Data | Padding)[:min(len(Data | Padding), 32)])
+AUTH_HMAC_S = HMAC_S(MASKED_DATA_LEN | MASKED_RESTLS_COMMAND | Data | Padding)
+AUTH_S =  AUTH_HMAC_S | MASKED_DATA_LEN | MASKED_RESTLS_COMMAND
 ```
+
+TLS 1.2:
+```
+`{}` means encrypted.
+
+    Restls Client               Restls Server          example.com Server
+
+     ClientHello     ----->        (Relay)      ----->
+      +restls_client_auth                               ServerHello
+                                                        Certificate*
+                                                        ServerKeyExchange*
+                                                        CertificateRequest*
+                     <-----        (Relay)      <-----  ServerHelloDone   
+     Certificate*
+     ClientKeyExchange
+     CertificateVerify*
+     [ChangeCipherSpec]
+     Finished        ----->        
+                            (verify client pub key)
+                                   (Relay)      ----->  [ChangeCipherSpec]
+                                                <-----  Finished
+                                 [ChangeCipherSpec]
+                     <-----      RestlsServerAuth
+     try_decrypt(UndoRestlsServerAuth)
+      > succeeded
+     [AUTH_C | Data] ----->      [Data]          ----->  Shadowsocks Server
+     [Data]          <-----      [AUTH_S | Data] <-----  Shadowsocks Server
+                                    ....
+where
+AUTH_C and AUTH_S is defined above
+```
+
+### Additional Information
+1. Restls does not support certain TLS 1.2 ciphers that use RSA Key Exchange.
+2. Restls does not support `HelloRetryRequest` in TLS 1.3. In principle, the `legacy_session_id` of the `ClientHelloRetry` must be consistent with that of the ClientHello, but the `key_share` can change.

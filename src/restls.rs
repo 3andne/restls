@@ -17,7 +17,7 @@ use crate::{
     client_hello::ClientHello,
     client_key_exchange::ClientKeyExchange,
     common::{
-        BUF_SIZE, RECORD_ALERT, RECORD_APPLICATION_DATA, RECORD_CCS, RECORD_HANDSHAKE,
+        CCS_RECORD, RECORD_ALERT, RECORD_APPLICATION_DATA, RECORD_CCS, RECORD_HANDSHAKE,
         RESTLS_APPDATA_HMAC_LEN, RESTLS_APPDATA_LEN_OFFSET, RESTLS_APPDATA_OFFSET,
         RESTLS_HANDSHAKE_HMAC_LEN, RESTLS_MASK_LEN, TO_CLIENT_MAGIC, TO_SERVER_MAGIC,
     },
@@ -401,6 +401,11 @@ impl<'a> RestlsState<'a> {
                     let _ = res?;
                     match inbound.codec().peek_record_type()? {
                         RECORD_CCS if !ccs_from_client => {
+                            if inbound.codec().peek_record().unwrap() != CCS_RECORD {
+                                return Err(anyhow!(
+                                    "reject: tls13 incorrect CCS record from client",
+                                ));
+                            }
                             ccs_from_client = true;
                         }
                         RECORD_APPLICATION_DATA if ccs_from_client => {
@@ -479,6 +484,11 @@ impl<'a> RestlsState<'a> {
         let rtype = inbound.codec().peek_record_type()?;
         match rtype {
             RECORD_CCS => {
+                if inbound.codec().peek_record().unwrap() != CCS_RECORD {
+                    return Err(anyhow!(
+                        "reject: tls12 incorrect CCS record from client",
+                    ));
+                }
                 flow.ccs_from_client()?;
                 Ok(())
             }

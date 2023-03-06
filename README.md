@@ -1,9 +1,32 @@
 # Restls
 
-For more details regarding the protocol:  
-[Restls: A Perfect Impersonation of TLS Handshake](./Restls%3A%20A%20Perfect%20Impersonation%20of%20TLS%20Handshake.md)
+A protocol to disguise your proxy traffic as normal TLS traffic.  
 
-[Restls: 对TLS握手的完美伪装](./Restls%3A%20%E5%AF%B9TLS%E6%8F%A1%E6%89%8B%E7%9A%84%E5%AE%8C%E7%BE%8E%E4%BC%AA%E8%A3%85.md)
+For more details regarding how restls parrots any tls site:  
+[Restls: A Perfect Impersonation of TLS Handshake](./Restls%3A%20A%20Perfect%20Impersonation%20of%20TLS.md)
+
+如果你想知道Restls是如何伪装成任何一个TLS网站的，请阅读：   
+[Restls: 对TLS的完美伪装](./Restls%3A%20%E5%AF%B9TLS%E7%9A%84%E5%AE%8C%E7%BE%8E%E4%BC%AA%E8%A3%85.md)
+
+## Hide Your Proxy Traffic Behavior
+
+"TLS in TLS" and other proxy-specific traffic behaviors can be used to identify TLS-based protocols. A typical "TLS in TLS" connection is shown in the following diagram:  
+
+"TLS in TLS"等代理特有流量行为可以被用来识别基于TLS的协议，一个典型的"TLS in TLS"连接如图所示：
+
+![tls-in-tls](assets/tls-in-tls-illustration.png)
+
+Restls disrupts these obvious proxy behavior characteristics through the use of "restls-scripts". The following diagram shows Restls traffic disguised using `restls-scripts`:  
+
+Restls通过「剧本」机制来破坏这些明显的代理行为特征，下图为使用「剧本」伪装后的Restls流量：
+
+![restls-script](assets/restls-script.png)
+
+If you want to learn more about how `restls-scripts` work and how to design your own, please refer to: [Restls-Script: Hide Your Proxy Traffic Behavior](./Restls-Script:%20Hide%20Your%20Proxy%20Traffic%20Behavior.md)  
+
+如果你想了解更多关于「剧本」是如何运作的，以及如何设计自己的「剧本」，请参考：[Restls-Script: 隐藏你的代理行为](./Restls-Script:%20隐藏你的代理行为.md)
+
+## Usage
 
 To build it from source:
 
@@ -14,23 +37,28 @@ cargo build --release
 Basic usage:
 ```
 USAGE:
-    restls --forward-to <forward-to> --listen <listen> --log-level <log-level> --password <password> --server-hostname <server-hostname>
+    restls --forward-to <forward-to> --listen <listen> --log-level <log-level> --password <password> --server-hostname <server-hostname> --script <script>
 ```
 
-Currently only TLS 1.3 is implemented. TLS 1.2 remains a work in progress.
+
 
 To deploy a Restls Service:
 1. Start the shadowsocks server:
     ```
-    ss-server -p 8888 -k [YOUR_SS_PASSWORD]
+    ss-server -s 127.0.0.1 -p 8888 -k [YOUR_SS_PASSWORD]
     ```
 2. Start the Restls server:
+   To parrot a TLS 1.3 server:
    ```
-   restls -s "www.microsoft.com" -l "0.0.0.0:443" -p [YOUR_RESTLS_PASSWORD] -f "127.0.0.1:8888"
+   restls -s "www.microsoft.com" -l "0.0.0.0:443" -p [YOUR_RESTLS_PASSWORD] -f "127.0.0.1:8888" --script "200?100,400?100,1200?200<1,1100~300,1000~100<1,2500~500,1300~50,1300~50,100~1200"
+   ```
+   Or to parrot a TLS 1.2 server:
+   ```
+   restls -s "vscode.dev" -l "0.0.0.0:443" -p [YOUR_RESTLS_PASSWORD] -f "127.0.0.1:8888" --script "200?100,400?100,1200?200<1,1100~300,1000~100<1,2500~500,1300~50,1300~50,100~1200"
    ```
 3. Define a restls proxy in [Clash.Meta Restls fork](https://github.com/3andne/Clash.Meta#restls)
    ```
-   - name: restls
+   - name: restls-tls13
      type: ss
      server: [YOUR_SERVER_IP]
      port: 443
@@ -41,4 +69,21 @@ To deploy a Restls Service:
          host: "www.microsoft.com" # Must be a TLS 1.3 server
          password: [YOUR_RESTLS_PASSWORD]
          version-hint: "tls13"
+         client-id: chrome # One of: chrome, ios, firefox or safari
+   - name: restls-tls12
+     type: ss
+     server: [YOUR_SERVER_IP]
+     port: 443
+     cipher: chacha20-ietf-poly1305
+     password: [YOUR_SS_PASSWORD]
+     plugin: restls
+     plugin-opts:
+         host: "vscode.dev" # Must be a TLS 1.2 server
+         password: [YOUR_RESTLS_PASSWORD]
+         version-hint: "tls12"
+         curve-id-hint: "curvep384" # One of: x25519, curvep384, curvep521 or curvep256
+                                    # If you have no idea, just choose a random one.
+                                    # If that's incorrect, your first connection will fail.
+                                    # But the client will correct that for you.
+         client-id: firefox # One of: chrome, ios, firefox or safari
    ```

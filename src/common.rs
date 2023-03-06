@@ -22,7 +22,7 @@ pub const EXTENSION_KEY_SHARE: u16 = 0x0033;
 pub const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 01;
 pub const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 02;
 pub const HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE: u8 = 0x10;
-pub const HANDSHAKE_TYPE_SERVER_HELLO_DONE: u8 = 0x0e;
+pub const _HANDSHAKE_TYPE_SERVER_HELLO_DONE: u8 = 0x0e;
 
 pub const HELLO_RETRY_RANDOM: [u8; 32] = [
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
@@ -33,3 +33,5 @@ pub const TO_CLIENT_MAGIC: &'static [u8] = "server-to-client".as_bytes();
 pub const TO_SERVER_MAGIC: &'static [u8] = "client-to-server".as_bytes();
 
 pub const BUF_SIZE: usize = 0x3000;
+
+pub const CCS_RECORD: &'static [u8] = &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
