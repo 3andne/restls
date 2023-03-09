@@ -66,8 +66,8 @@ impl ClientHello {
         key_share
     }
 
-    pub(crate) fn parse(buf: &mut Cursor<&[u8]>) -> Result<ClientHello> {
-        debug!("parsing client hello: {}", buf.remaining());
+    pub(crate) fn parse(buf: &mut Cursor<&[u8]>, id: usize) -> Result<ClientHello> {
+        debug!("[{}]parsing client hello: {}", id, buf.remaining());
 
         buf.advance(5); // record header
         let mut _client_random = [0; 32];

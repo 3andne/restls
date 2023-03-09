@@ -17,14 +17,16 @@ use crate::{
     client_hello::ClientHello,
     client_key_exchange::ClientKeyExchange,
     common::{
-        CCS_RECORD, RECORD_ALERT, RECORD_APPLICATION_DATA, RECORD_CCS, RECORD_HANDSHAKE,
-        RESTLS_APPDATA_HMAC_LEN, RESTLS_APPDATA_LEN_OFFSET, RESTLS_APPDATA_OFFSET,
-        RESTLS_HANDSHAKE_HMAC_LEN, RESTLS_MASK_LEN, TO_CLIENT_MAGIC, TO_SERVER_MAGIC,
+        CCS_RECORD, CLIENT_AUTH_SESSION_TICKET_LEN, CLIENT_AUTH_SESSION_TICKET_OFFSET,
+        HANDSHAKE_TYPE_SERVER_KEY_EXCHANGE, RECORD_ALERT, RECORD_APPLICATION_DATA, RECORD_CCS,
+        RECORD_HANDSHAKE, RESTLS_APPDATA_HMAC_LEN, RESTLS_APPDATA_LEN_OFFSET,
+        RESTLS_APPDATA_OFFSET, RESTLS_HANDSHAKE_HMAC_LEN, RESTLS_MASK_LEN, TLS_RECORD_HEADER_LEN,
+        TO_CLIENT_MAGIC, TO_SERVER_MAGIC,
     },
     server_hello::ServerHello,
     utils::{
-        copy_bidirectional_fallback, tcp_rst, xor_bytes, DoubleCursorBuf, RestlsCommand, TLSCodec,
-        TLSStream,
+        copy_bidirectional_fallback, tcp_rst, xor_bytes, DoubleCursorBuf, HandshakeRecord,
+        RestlsCommand, TLSCodec, TLSStream,
     },
 };
 
@@ -35,6 +37,8 @@ enum TLS12Flow {
     FullHandshakeClientCCS,
     ResumeClientCCS,
     FullHandshakeServerCCS,
+    FullHandshakeServerFinished,
+    ResumeServerFinished,
     ResumeServerCCS,
     Client0x17,
 }
@@ -90,20 +94,20 @@ impl TLS12Flow {
     fn client_0x17(&mut self) -> Result<()> {
         use TLS12Flow::*;
         match self {
-            FullHandshakeServerCCS | ResumeClientCCS => {
+            FullHandshakeServerFinished | ResumeClientCCS => {
                 *self = TLS12Flow::Client0x17;
                 Ok(())
             }
             _ => Err(anyhow!(
-                "reject: invalid flow, expect FullHandshakeServerCCS | ResumeClientCCS, actual: {:?}",
+                "reject: invalid flow, expect FullHandshakeServerFinished | ResumeClientCCS, actual: {:?}",
                 self
             )),
         }
     }
 
-    fn is_ccs_from_server(&self) -> bool {
+    fn is_server_finished(&self) -> bool {
         match self {
-            TLS12Flow::FullHandshakeServerCCS | TLS12Flow::ResumeServerCCS => true,
+            TLS12Flow::ResumeServerFinished | TLS12Flow::FullHandshakeServerFinished => true,
             _ => false,
         }
     }
@@ -137,6 +141,25 @@ impl TLS12Flow {
             _ => false,
         }
     }
+
+    fn server_0x16(&mut self) -> Result<()> {
+        use TLS12Flow::*;
+        debug!("server_0x16");
+        match self {
+            FullHandshakeServerCCS => {
+                *self = FullHandshakeServerFinished;
+                Ok(())
+            }
+            ResumeServerCCS => {
+                *self = ResumeServerFinished;
+                Ok(())
+            }
+            FullHandshakeServerFinished | ResumeServerFinished => Err(anyhow!(
+                "reject: there should be no 0x16 from server after ServerFinished"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 enum WriteToServerResult {
@@ -147,12 +170,14 @@ enum WriteToServerResult {
 pub struct RestlsState<'a> {
     client_hello: Option<ClientHello>,
     server_hello: Option<ServerHello>,
+    curve_id: Option<usize>,
     client_finished: Vec<u8>,
     restls_password: &'a [u8; 32],
-    to_client_counter: u32,
-    to_server_counter: u32,
+    to_client_counter: u64,
+    to_server_counter: u64,
     script: &'a Script,
     min_record_len: usize,
+    parrot_tls12_gcm: bool,
     id: usize,
 }
 
@@ -178,8 +203,27 @@ impl<'a> RestlsState<'a> {
         hasher
     }
 
+    #[inline]
+    fn restls_data_offset(&self, to_client: bool) -> usize {
+        self.restls_header_offset(to_client) + RESTLS_APPDATA_OFFSET
+    }
+
+    #[inline]
+    fn restls_header_offset(&self, to_client: bool) -> usize {
+        TLS_RECORD_HEADER_LEN
+            + if !to_client && self.server_hello.as_ref().unwrap().is_tls12_gcm
+                || to_client && self.parrot_tls12_gcm
+            {
+                8
+            } else {
+                0
+            }
+    }
+
     pub fn read_app_data<'b>(&mut self, record: &'b mut [u8]) -> Result<(&'b [u8], RestlsCommand)> {
-        if record.len() < RESTLS_APPDATA_OFFSET {
+        let is_tls12_gcm = self.server_hello.as_ref().unwrap().is_tls12_gcm;
+
+        if record.len() < self.restls_data_offset(false) {
             return Err(anyhow!(
                 "[{}]reject: restls application data isn't long enough",
                 self.id
@@ -192,23 +236,41 @@ impl<'a> RestlsState<'a> {
                 record
             ));
         }
-        let actual_auth = &record[5..5 + RESTLS_APPDATA_HMAC_LEN];
+        if is_tls12_gcm {
+            let to_server_counter = u64::from_be_bytes(
+                record[TLS_RECORD_HEADER_LEN..TLS_RECORD_HEADER_LEN + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            if to_server_counter != self.to_server_counter + 1 {
+                return Err(anyhow!(
+                    "[{}]reject: invalid to server counter for tls 1.2 aes-gcm, expect {}, actual {}",
+                    self.id,
+                    self.to_server_counter + 1, to_server_counter
+                ));
+            }
+        }
         let mut hmac_auth = self.restls_appdata_auth_hmac(false);
         if self.client_finished.len() > 0 {
             debug!("adding client_finished {:?}", self.client_finished);
             hmac_auth.update(&self.client_finished);
             self.client_finished.resize(0, 0);
         }
+        let header_offset = self.restls_header_offset(false);
+        hmac_auth.update(&record[..header_offset]);
+        let record = &mut record[header_offset..];
+        let actual_auth = &record[..RESTLS_APPDATA_HMAC_LEN];
         hmac_auth.update(&record[RESTLS_APPDATA_LEN_OFFSET..]);
         let expect_auth = hmac_auth.finalize().into_bytes();
         if actual_auth != &expect_auth[..RESTLS_APPDATA_HMAC_LEN] {
             debug!(
-                "[{}]bad mac record, expect auth {:?}, actual {:?}, to_client: {}, to_server: {}",
+                "[{}]bad mac record, expect auth {:?}, actual {:?}, to_client: {}, to_server: {}, record: {:?}",
                 self.id,
                 &expect_auth[..RESTLS_APPDATA_HMAC_LEN],
                 actual_auth,
                 self.to_client_counter,
-                self.to_server_counter
+                self.to_server_counter,
+                record,
             );
             return Err(anyhow!("reject: bad mac record"));
         }
@@ -254,6 +316,20 @@ impl<'a> RestlsState<'a> {
         command: RestlsCommand,
     ) {
         let record = out_buf.load_mut();
+
+        record[0..3].copy_from_slice(&[0x17, 0x3, 0x3]);
+        let payload_len = (record.len() - 5) as u16;
+        record[3..5].copy_from_slice(&payload_len.to_be_bytes());
+
+        if self.parrot_tls12_gcm {
+            record[5..13].copy_from_slice(&(self.to_client_counter + 1).to_be_bytes());
+        }
+
+        let mut hmac_auth = self.restls_appdata_auth_hmac(true);
+        let header_offset = self.restls_header_offset(true);
+        hmac_auth.update(&record[..header_offset]);
+        let record = &mut record[header_offset..];
+
         let mut hmac_mask = self.restls_appdata_auth_hmac(true);
         hmac_mask.update(sample_slice(&record[RESTLS_APPDATA_OFFSET..]));
         let mask = hmac_mask.finalize().into_bytes();
@@ -264,19 +340,16 @@ impl<'a> RestlsState<'a> {
             &mask[..RESTLS_MASK_LEN],
             &mut record[RESTLS_APPDATA_LEN_OFFSET..],
         );
-        let mut hmac_auth = self.restls_appdata_auth_hmac(true);
+
         hmac_auth.update(&record[RESTLS_APPDATA_LEN_OFFSET..]);
         let auth = hmac_auth.finalize().into_bytes();
-        record[5..5 + RESTLS_APPDATA_HMAC_LEN].copy_from_slice(&auth[..RESTLS_APPDATA_HMAC_LEN]);
-        record[0..3].copy_from_slice(&[0x17, 0x3, 0x3]);
-        let payload_len = (record.len() - 5) as u16;
-        record[3..5].copy_from_slice(&payload_len.to_be_bytes());
+        record[..RESTLS_APPDATA_HMAC_LEN].copy_from_slice(&auth[..RESTLS_APPDATA_HMAC_LEN]);
         debug!(
             "[{}]write_header: data_len {}, padding: {}, mask: {:?}, auth: {:?}
             to_server {}, to_client {}",
             self.id,
             data_len,
-            record.len() - RESTLS_APPDATA_OFFSET - data_len,
+            record.len() - data_len,
             &mask[..RESTLS_MASK_LEN],
             &auth[..RESTLS_APPDATA_HMAC_LEN],
             self.to_server_counter,
@@ -313,8 +386,9 @@ impl<'a> RestlsState<'a> {
             .next_record()
             .expect("unexpected error: record has been checked");
         let mut cursor = Cursor::new(&*record);
-        self.client_hello =
-            Some(ClientHello::parse(&mut cursor).context("unable to parse client hello: ")?);
+        self.client_hello = Some(
+            ClientHello::parse(&mut cursor, self.id).context("unable to parse client hello: ")?,
+        );
         Ok(())
     }
 
@@ -329,13 +403,18 @@ impl<'a> RestlsState<'a> {
                 rtype
             ));
         }
-        let record = outbound
-            .codec_mut()
-            .next_record()
-            .expect("unexpected error: record has been checked");
-        let mut cursor = Cursor::new(&*record);
+        let mut record = HandshakeRecord::new(
+            outbound
+                .codec_mut()
+                .peek_record_mut()
+                .expect("unexpected error: record has been checked"),
+        );
+        let mut cursor = Cursor::new(&*record.next_handshake_message()?);
         self.server_hello =
             Some(ServerHello::parse(&mut cursor).context("unable to parse client hello: ")?);
+        if !record.has_next() {
+            outbound.codec_mut().next_record().unwrap();
+        }
         Ok(())
     }
 
@@ -372,7 +451,7 @@ impl<'a> RestlsState<'a> {
         Ok(())
     }
 
-    fn prepare_server_auth(&self, outbound: &mut TLSStream) {
+    fn prepare_server_auth(&mut self, outbound: &mut TLSStream) {
         let mut hasher = self.restls_hmac();
         hasher.update(&self.server_hello.as_ref().unwrap().server_random);
         let secret = hasher.finalize().into_bytes();
@@ -385,7 +464,14 @@ impl<'a> RestlsState<'a> {
             .codec_mut()
             .peek_record_mut()
             .expect("unexpected error: record has been checked");
-        xor_bytes(&secret[..RESTLS_HANDSHAKE_HMAC_LEN], &mut record[5..]);
+        let mut offset = 5;
+        if self.server_hello.as_ref().unwrap().is_tls12_gcm {
+            if u64::from_be_bytes(record[5..13].try_into().unwrap()) == 0 {
+                offset = 13;
+                self.parrot_tls12_gcm = true;
+            }
+        }
+        xor_bytes(&secret[..RESTLS_HANDSHAKE_HMAC_LEN], &mut record[offset..]);
     }
 
     async fn try_read_tl13_till_client_application_data(
@@ -457,30 +543,53 @@ impl<'a> RestlsState<'a> {
         }
     }
 
-    fn handle_tls12_outbound(&self, outbound: &mut TLSStream, flow: &mut TLS12Flow) -> Result<()> {
+    fn handle_tls12_plaintext_handshake_msg(&mut self, record: &mut [u8]) {
+        let mut hs = HandshakeRecord::new(record);
+        while hs.has_next() {
+            let msg = hs.next_handshake_message().unwrap();
+            if msg[0] == HANDSHAKE_TYPE_SERVER_KEY_EXCHANGE && msg[4] == 3 {
+                let curve_id_u16 = u16::from_be_bytes([msg[5], msg[6]]);
+                self.curve_id = Some(curve_id_u16 as usize);
+            } else if msg[0] == HANDSHAKE_TYPE_SERVER_KEY_EXCHANGE {
+                debug!("[{}]curve not available {:?}", self.id, &msg[4..6]);
+            }
+        }
+    }
+
+    fn handle_tls12_outbound(
+        &mut self,
+        outbound: &mut TLSStream,
+        flow: &mut TLS12Flow,
+    ) -> Result<()> {
+        debug!("handle_tls12_outbound");
         let rtype = outbound.codec().peek_record_type()?;
         match rtype {
             RECORD_CCS => {
                 flow.ccs_from_server()?;
             }
-            RECORD_HANDSHAKE if flow.is_ccs_from_server() => {
-                if flow.is_resume() {
-                    self.check_tls12_session_ticket()?;
+            RECORD_HANDSHAKE => {
+                flow.server_0x16()?;
+                if flow.is_server_finished() {
+                    if flow.is_resume() {
+                        self.check_tls12_session_ticket()?;
+                    }
+                    self.prepare_server_auth(outbound);
+                    debug!("[{}]sending tls12 server auth to client {:?}", self.id, outbound.codec_mut().peek_record_mut());
+                    return Ok(());
                 }
-                self.prepare_server_auth(outbound);
-                debug!("[{}]sending tls12 server auth to client", self.id);
+                let record = outbound.codec_mut().peek_record_mut().unwrap();
+                self.handle_tls12_plaintext_handshake_msg(record);
             }
-            RECORD_HANDSHAKE => (),
-            _ => {
-                return Err(anyhow!(
-                    "reject: incorrect outbound tls12 record type, expected 1 CCS or Handshake, actual {rtype}",
-                ))
-            }
+            RECORD_APPLICATION_DATA if flow.is_server_finished() => {
+                self.to_client_counter += 1;
+            },
+            _ => return Err(anyhow!("reject: incorrect outbound tls12 record type, expected 1 CCS or Handshake, actual {rtype}",)),
         }
         Ok(())
     }
 
     fn handle_tls12_inbound(&mut self, inbound: &TLSStream, flow: &mut TLS12Flow) -> Result<()> {
+        debug!("handle_tls12_inbound");
         let rtype = inbound.codec().peek_record_type()?;
         match rtype {
             RECORD_CCS => {
@@ -498,9 +607,14 @@ impl<'a> RestlsState<'a> {
                     .codec()
                     .peek_record()
                     .expect("unexpected error: record has been checked");
+                if self.curve_id.is_none() {
+                    debug!("[{}]session_ticket: {:?}",self.id, self.client_hello.as_ref().unwrap().session_ticket);
+                    return Err(anyhow!("reject: curve_id is not set"));
+                }
                 ClientKeyExchange::check(
                     &mut Cursor::new(maybe_cke),
                     self.client_hello.as_ref().unwrap(),
+                    self.curve_id.unwrap(),
                     self.restls_hmac(),
                 )?;
                 flow.cke_verified()
@@ -527,7 +641,13 @@ impl<'a> RestlsState<'a> {
     ) -> Result<()> {
         let mut flow = TLS12Flow::Initial;
         loop {
-            debug!("[{}]flow {:?}", self.id, flow);
+            debug!(
+                "[{}]flow {:?}, outbound {}, inbound {}",
+                self.id,
+                flow,
+                outbound.codec().has_next(),
+                inbound.codec().has_next()
+            );
             select! {
                 ret = self.read_from_stream(outbound) => {
                     match ret {
@@ -564,8 +684,8 @@ impl<'a> RestlsState<'a> {
         let client_hello = self.client_hello.as_ref().unwrap();
         hasher.update(&client_hello.session_ticket);
         let actual_hash = hasher.finalize().into_bytes();
-        if &client_hello.session_id[RESTLS_HANDSHAKE_HMAC_LEN..]
-            != &actual_hash[..RESTLS_HANDSHAKE_HMAC_LEN]
+        if &client_hello.session_id[CLIENT_AUTH_SESSION_TICKET_OFFSET..]
+            != &actual_hash[..CLIENT_AUTH_SESSION_TICKET_LEN]
         {
             Err(anyhow!("reject: tls 1.2 session ticket mismatched"))
         } else {
@@ -579,8 +699,10 @@ impl<'a> RestlsState<'a> {
         from_stream: &mut TLSStream,
     ) -> Result<()> {
         if from_stream.codec().has_next() {
+            debug!("[{}]not relaying until data all read", self.id);
             return Ok(());
         }
+        debug!("[{}]relay data", self.id);
         let res = match to_stream
             .get_mut()
             .write_all(&from_stream.codec().raw_buf())
@@ -675,7 +797,7 @@ impl<'a> RestlsState<'a> {
         inbound: &mut TLSStream,
         outbound: &mut TcpStream,
     ) -> Result<()> {
-        let mut out_buf = DoubleCursorBuf::new();
+        let mut out_buf = DoubleCursorBuf::new(self.restls_data_offset(true));
         let mut awaiting = false;
         let mut need_respond = 0;
         async fn read_if_has_capacity(
@@ -797,12 +919,14 @@ pub async fn handle(options: Arc<Opt>, inbound: TcpStream, id: usize) -> Result<
     let mut try_handshake = RestlsState {
         client_hello: None,
         server_hello: None,
+        curve_id: None,
         restls_password: &options.password.as_bytes(),
         client_finished: Vec::new(),
         to_client_counter: 0,
         to_server_counter: 0,
         script: &options.script,
         min_record_len: options.min_record_len as usize,
+        parrot_tls12_gcm: false,
         id,
     };
     match try_handshake

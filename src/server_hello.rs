@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut};
-use tracing::debug;
 use std::io::Cursor;
+use tracing::debug;
 
 use crate::{
     common::{
         EXTENSION_KEY_SHARE, EXTENSION_SUPPORTED_VERSIONS, HANDSHAKE_TYPE_SERVER_HELLO,
-        HELLO_RETRY_RANDOM,
+        HELLO_RETRY_RANDOM, TLS12_GCM_CIPHER_SUITES,
     },
     utils::{extend_from_length_prefixed, skip_length_padded, u16_length_prefixed},
 };
@@ -15,6 +15,7 @@ pub(crate) struct ServerHello {
     pub(crate) is_tls13: bool,
     pub(crate) server_random: [u8; 32],
     pub(crate) _key_share: Vec<u8>,
+    pub(crate) is_tls12_gcm: bool,
 }
 
 impl ServerHello {
@@ -37,7 +38,6 @@ impl ServerHello {
     }
 
     pub(crate) fn parse(buf: &mut Cursor<&[u8]>) -> Result<Self> {
-        buf.advance(5); // record header
         let htype = buf.get_u8();
         if htype != HANDSHAKE_TYPE_SERVER_HELLO {
             return Err(anyhow!(
@@ -55,7 +55,8 @@ impl ServerHello {
             return Err(anyhow!("reject: we don't allow a Hello Retry Request"));
         }
         skip_length_padded::<1, _>(buf); // skip session id
-        buf.advance(2 + 1 + 2); // skip cipher suite + compression method + Extensions Length
+        let cipher_suite = buf.get_u16();
+        buf.advance(1 + 2); // skip cipher suite + compression method + Extensions Length
         let mut is_tls13 = false;
         let mut key_share = Vec::new();
         while buf.has_remaining() {
@@ -76,6 +77,7 @@ impl ServerHello {
             is_tls13,
             server_random,
             _key_share: key_share,
+            is_tls12_gcm: TLS12_GCM_CIPHER_SUITES.contains(&cipher_suite),
         })
     }
 }

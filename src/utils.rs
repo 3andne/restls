@@ -12,10 +12,11 @@ use tracing::debug;
 
 use tokio_util::codec::{Decoder, Framed};
 
-use crate::common::{BUF_SIZE, RESTLS_APPDATA_OFFSET};
+use crate::common::{BUF_SIZE, RECORD_HANDSHAKE};
 
 pub type TLSStream = Framed<TcpStream, TLSCodec>;
 
+#[derive(Debug)]
 enum RecordChecker {
     Outbound,
     NewInbound,
@@ -153,11 +154,12 @@ impl Decoder for TLSCodec {
         let mut cursor = 0;
         while cursor + 5 < src.len() {
             if !self.checker.check(&src[cursor..]) {
+                debug!("record check failed: {:?}", &src[..]);
                 self.enable_codec = false;
                 return self.decode(src);
             }
             let record_len = ((src[cursor + 3] as u16) << 8 | (src[cursor + 4] as u16)) as usize;
-            debug!("incoming record len: {}", record_len);
+            debug!("[{:?}]incoming record len: {}", self.checker, record_len);
             if src.len() < cursor + 5 + record_len {
                 break;
             }
@@ -173,7 +175,7 @@ impl Decoder for TLSCodec {
 
         src.copy_to_slice(&mut self.buf);
 
-        tracing::debug!("decoded: {}", self.buf.len());
+        tracing::debug!("[{:?}]decoded: {}", self.checker, self.buf.len());
 
         Ok(Some(()))
     }
@@ -443,15 +445,17 @@ pub struct DoubleCursorBuf {
     front_cursor: usize,
     back_cursor: usize,
     load_len: usize,
+    conent_offset: usize,
 }
 
 impl DoubleCursorBuf {
-    pub fn new() -> Self {
+    pub fn new(conent_offset: usize) -> Self {
         Self {
             inner: [0; BUF_SIZE],
             front_cursor: 0,
-            back_cursor: RESTLS_APPDATA_OFFSET,
+            back_cursor: conent_offset,
             load_len: 0,
+            conent_offset,
         }
     }
 
@@ -471,18 +475,17 @@ impl DoubleCursorBuf {
     }
 
     pub fn len(&self) -> usize {
-        self.back_cursor - self.front_cursor - RESTLS_APPDATA_OFFSET
+        self.back_cursor - self.front_cursor - self.conent_offset
     }
 
     pub fn load_mut(&mut self) -> &mut [u8] {
-        &mut self.inner
-            [self.front_cursor..self.front_cursor + RESTLS_APPDATA_OFFSET + self.load_len]
+        &mut self.inner[self.front_cursor..self.front_cursor + self.conent_offset + self.load_len]
     }
 
     pub fn release(&mut self) {
         self.front_cursor += self.load_len;
         self.load_len = 0;
-        if self.front_cursor + RESTLS_APPDATA_OFFSET == self.back_cursor {
+        if self.front_cursor + self.conent_offset == self.back_cursor {
             self.reset()
         }
     }
@@ -504,7 +507,7 @@ impl DoubleCursorBuf {
 
     pub fn reset(&mut self) {
         self.front_cursor = 0;
-        self.back_cursor = RESTLS_APPDATA_OFFSET;
+        self.back_cursor = self.conent_offset;
     }
 
     pub fn back_mut(&mut self) -> &mut [u8] {
@@ -517,5 +520,37 @@ impl DoubleCursorBuf {
     pub fn advance_back(&mut self, len: usize) {
         assert!(self.back_cursor + len <= self.inner.len());
         self.back_cursor += len;
+    }
+}
+
+pub struct HandshakeRecord<'a> {
+    hs_msg_cursor: usize,
+    record: &'a mut [u8],
+}
+
+impl<'a> HandshakeRecord<'a> {
+    pub fn new(record: &'a mut [u8]) -> Self {
+        assert!(record[0] == RECORD_HANDSHAKE);
+        Self {
+            hs_msg_cursor: 5,
+            record,
+        }
+    }
+
+    fn peek_handshake_message_len(&self) -> Result<usize> {
+        Ok(4 + ((self.record[self.hs_msg_cursor + 1] as usize) << 16
+            | (self.record[self.hs_msg_cursor + 2] as usize) << 8
+            | (self.record[self.hs_msg_cursor + 3] as usize)))
+    }
+
+    pub fn next_handshake_message(&mut self) -> Result<&mut [u8]> {
+        let len = self.peek_handshake_message_len()?;
+        let start = self.hs_msg_cursor;
+        self.hs_msg_cursor += len;
+        Ok(&mut self.record[start..self.hs_msg_cursor])
+    }
+
+    pub fn has_next(&self) -> bool {
+        self.hs_msg_cursor < self.record.len()
     }
 }
