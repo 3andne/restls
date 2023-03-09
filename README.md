@@ -34,11 +34,15 @@ If you want to learn more about how `restls-scripts` work and how to design your
 
 ## Usage
 
-To build it from source:
+**Download [the latest release](https://github.com/3andne/restls/releases)**
+
+Or build it from source:
 
 ```
 cargo build --release
 ```
+
+
 
 Basic usage:
 ```
