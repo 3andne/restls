@@ -51,7 +51,7 @@ With these two capabilities, we can control the length and traffic pattern of Re
 ## Syntax
 
 Here we provide an example of how to write a "script".
-Take "200?10,300~50,70<2,100~1000<1" as an example. This script determines the behavior of the first four user data packets in Restls:
+Take `200?10,300~50,70<2,100~1000<1` as an example. This script determines the behavior of the first four user data packets in Restls:
 
 1. The length of the first data packet will be between 200 and 210, and this length will be determined at startup (assuming it is 203). The length of the first packet for each subsequent connection will also be 203.
 2. The length of the second data packet will be between 300 and 350, and unlike the first packet, this length will be randomly determined for each connection.
@@ -62,5 +62,5 @@ Take "200?10,300~50,70<2,100~1000<1" as an example. This script determines the b
 
 Despite providing stronger disguise capabilities, the "script" also has some limitations:
 
-1. The "fake response" mechanism will increase the number of round-trips during the inner tls handshake phase. Although it is not currently a targetable feature, the delay will be increased. This is a trade-off between stealthiness and user experience.
+1. The "fake response" mechanism will increase the number of round-trips during the inner tls handshake phase. Although it is not currently a targetable feature, the latency will be increased. This is a trade-off between stealthiness and user experience.
 2. Currently, the "script" is designed as a mechanism for the first few packets. Although you can write a long script, we do not provide syntax that covers all subsequent traffic. Disguising subsequent traffic patterns is theoretically more difficult. For example, a connection to video websites may have highly uneven uploads and downloads. No matter how it is disguised, the fact that a large amount of data needs to be transmitted cannot be hidden.
