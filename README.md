@@ -87,9 +87,5 @@ To deploy a Restls Service:
          host: "vscode.dev" # Must be a TLS 1.2 server
          password: [YOUR_RESTLS_PASSWORD]
          version-hint: "tls12"
-         curve-id-hint: "curvep384" # One of: x25519, curvep384, curvep521 or curvep256
-                                    # If you have no idea, just choose a random one.
-                                    # If that's incorrect, your first connection will fail.
-                                    # But the client will correct that for you.
          client-id: firefox # One of: chrome, ios, firefox or safari
    ```

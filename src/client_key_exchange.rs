@@ -6,7 +6,10 @@ use std::io::Cursor;
 
 use crate::{
     client_hello::ClientHello,
-    common::{HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE, RECORD_HANDSHAKE, RESTLS_HANDSHAKE_HMAC_LEN},
+    common::{
+        curve_id_to_index, CLIENT_AUTH_LAYOUT3, CLIENT_AUTH_LAYOUT4,
+        HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE, RECORD_HANDSHAKE,
+    },
 };
 
 pub struct ClientKeyExchange {}
@@ -15,6 +18,7 @@ impl ClientKeyExchange {
     pub(crate) fn check(
         buf: &mut Cursor<&[u8]>,
         client_hello: &ClientHello,
+        curve: usize,
         mut hasher: Hasher,
     ) -> Result<()> {
         assert_eq!(buf.get_u8(), RECORD_HANDSHAKE);
@@ -28,9 +32,14 @@ impl ClientKeyExchange {
         hasher.update(buf.chunk());
         let actual_hash = hasher.finalize().into_bytes();
 
-        if &client_hello.session_id[..RESTLS_HANDSHAKE_HMAC_LEN]
-            != &actual_hash[..RESTLS_HANDSHAKE_HMAC_LEN]
-        {
+        let curve_index = curve_id_to_index(curve)?;
+        let range = if client_hello.session_ticket.len() > 0 {
+            CLIENT_AUTH_LAYOUT4[curve_index]..CLIENT_AUTH_LAYOUT4[curve_index + 1]
+        } else {
+            CLIENT_AUTH_LAYOUT3[curve_index]..CLIENT_AUTH_LAYOUT3[curve_index + 1]
+        };
+        let hash_len = range.len();
+        if &client_hello.session_id[range] != &actual_hash[..hash_len] {
             Err(anyhow!(
                 "reject: tls 1.2 client pub key mismatched, expect {:?}, actual {:?}, key {:?}",
                 &client_hello.session_id,
