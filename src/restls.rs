@@ -264,13 +264,12 @@ impl<'a> RestlsState<'a> {
         let expect_auth = hmac_auth.finalize().into_bytes();
         if actual_auth != &expect_auth[..RESTLS_APPDATA_HMAC_LEN] {
             debug!(
-                "[{}]bad mac record, expect auth {:?}, actual {:?}, to_client: {}, to_server: {}, record: {:?}",
+                "[{}]bad mac record, expect auth {:?}, actual {:?}, to_client: {}, to_server: {}",
                 self.id,
                 &expect_auth[..RESTLS_APPDATA_HMAC_LEN],
                 actual_auth,
                 self.to_client_counter,
                 self.to_server_counter,
-                record,
             );
             return Err(anyhow!("reject: bad mac record"));
         }
@@ -574,7 +573,7 @@ impl<'a> RestlsState<'a> {
                         self.check_tls12_session_ticket()?;
                     }
                     self.prepare_server_auth(outbound);
-                    debug!("[{}]sending tls12 server auth to client {:?}", self.id, outbound.codec_mut().peek_record_mut());
+                    debug!("[{}]sending tls12 server auth to client", self.id);
                     return Ok(());
                 }
                 let record = outbound.codec_mut().peek_record_mut().unwrap();
