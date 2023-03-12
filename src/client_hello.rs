@@ -92,33 +92,37 @@ impl ClientHello {
 
         skip_length_padded::<2, _>(buf); // cipher suites
         skip_length_padded::<1, _>(buf); // compression methods
-        buf.advance(2); // Extensions Length
 
         let mut session_ticket = Vec::new();
         let mut client_supports_tls_13 = false;
         let mut psk = Vec::new();
         let mut key_share = Vec::new();
-        while buf.has_remaining() {
-            let ext = buf.get_u16();
-            match ext {
-                EXTENSION_SESSION_TICKET => {
-                    extend_from_length_prefixed::<2, _>(buf, &mut session_ticket);
-                }
-                EXTENSION_SUPPORTED_VERSIONS => {
-                    client_supports_tls_13 = Self::read_supported_version(buf);
-                }
-                EXTENSION_PRE_SHARED_KEY => {
-                    psk = Self::read_psk(buf);
-                }
-                EXTENSION_KEY_SHARE => {
-                    key_share = Self::read_key_share(buf);
-                    debug!("client key_share {:?}", key_share);
-                }
-                _ => {
-                    skip_length_padded::<2, _>(buf);
+        u16_length_prefixed(buf, |mut ext_section| {
+            while ext_section.has_remaining() {
+                let ext = ext_section.get_u16();
+                match ext {
+                    EXTENSION_SESSION_TICKET => {
+                        extend_from_length_prefixed::<2, _>(&mut ext_section, &mut session_ticket);
+                        debug!("session_ticket: {:?}", session_ticket);
+                    }
+                    EXTENSION_SUPPORTED_VERSIONS => {
+                        client_supports_tls_13 = Self::read_supported_version(&mut ext_section);
+                    }
+                    EXTENSION_PRE_SHARED_KEY => {
+                        psk = Self::read_psk(&mut ext_section);
+                        debug!("psk: {:?}", psk);
+                    }
+                    EXTENSION_KEY_SHARE => {
+                        key_share = Self::read_key_share(&mut ext_section);
+                        debug!("client key_share {:?}", key_share);
+                    }
+                    _ => {
+                        skip_length_padded::<2, _>(&mut ext_section);
+                    }
                 }
             }
-        }
+        });
+
         if !client_supports_tls_13 {
             return Err(anyhow!("reject: client must support tls 1.3"));
         }
