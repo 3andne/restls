@@ -23,7 +23,9 @@ impl ServerHello {
         let mut client_supports_tls_13 = false;
         u16_length_prefixed(buf, |mut extension| {
             client_supports_tls_13 = extension.get_u16().to_be_bytes() == [03, 04];
-        });
+            Ok(())
+        })
+        .unwrap(); // todo: check this for server
         client_supports_tls_13
     }
 
@@ -32,8 +34,10 @@ impl ServerHello {
         u16_length_prefixed(buf, |mut key_share_section| {
             key_share.reserve_exact(key_share_section.remaining());
             key_share.put_u16(key_share_section.get_u16()); // skip key_share group
-            extend_from_length_prefixed::<2, _>(&mut key_share_section, &mut key_share);
-        });
+            extend_from_length_prefixed::<2, _>(&mut key_share_section, &mut key_share)?;
+            Ok(())
+        })
+        .unwrap(); // todo: check this for server
         key_share
     }
 
@@ -54,7 +58,8 @@ impl ServerHello {
         if server_random == HELLO_RETRY_RANDOM {
             return Err(anyhow!("reject: we don't allow a Hello Retry Request"));
         }
-        skip_length_padded::<1, _>(buf); // skip session id
+        // todo
+        skip_length_padded::<1, _>(buf).unwrap(); // skip session id
         let cipher_suite = buf.get_u16();
         buf.advance(1 + 2); // skip cipher suite + compression method + Extensions Length
         let mut is_tls13 = false;
@@ -69,7 +74,7 @@ impl ServerHello {
                     key_share = Self::read_key_share(buf);
                 }
                 _ => {
-                    skip_length_padded::<2, _>(buf);
+                    skip_length_padded::<2, _>(buf).unwrap(); // todo
                 }
             }
         }
