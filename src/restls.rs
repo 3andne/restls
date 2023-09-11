@@ -50,7 +50,7 @@ impl TLS12Flow {
                 *self = TLS12Flow::FullHandshakeClientCCS;
                 Ok(())
             }
-            TLS12Flow::ResumeServerCCS => {
+            TLS12Flow::ResumeServerFinished => {
                 *self = TLS12Flow::ResumeClientCCS;
                 Ok(())
             }
@@ -384,7 +384,7 @@ impl<'a> RestlsState<'a> {
 
     async fn try_read_client_hello(&mut self, inbound: &mut TLSStream) -> Result<()> {
         match self.read_from_stream(inbound, false).await {
-            Err(e) => return Err(anyhow!("failed to read client hello: {:?}", e)),
+            Err(e) => return Err(anyhow!("failed to read client hello: {}", e)),
             Ok(()) => (),
         };
         let rtype = inbound.codec().peek_record_type()?;
@@ -482,8 +482,10 @@ impl<'a> RestlsState<'a> {
             if u64::from_be_bytes(record[5..13].try_into().unwrap()) == 0 {
                 offset = 13;
                 self.parrot_tls12_gcm = true;
+                debug!("[{}]parrot tls12 gcm", self.id);
             }
         }
+        debug!("[{}]original server auth {:?}", self.id, record);
         xor_bytes(&secret[..RESTLS_HANDSHAKE_HMAC_LEN], &mut record[offset..]);
     }
 
@@ -497,7 +499,7 @@ impl<'a> RestlsState<'a> {
         loop {
             select! {
                 res = self.read_from_stream(inbound, false) => {
-                    let _ = res?;
+                    let _ = res.context("try_read_tl13_till_client_application_data inbound: ")?;
                     match inbound.codec().peek_record_type()? {
                         RECORD_CCS if !ccs_from_client => {
                             if inbound.codec().peek_record().unwrap() != CCS_RECORD {
@@ -525,8 +527,11 @@ impl<'a> RestlsState<'a> {
                     self.relay_to(outbound, inbound).await?;
                 }
                 res = self.read_from_stream(outbound, false) => {
-                    let _ = res?;
-                    outbound.codec_mut().skip_to_end();
+                    let _ = res.context("try_read_tl13_till_client_application_data outbound: ")?;
+                    outbound.codec_mut().next_record().unwrap();
+                    if seen_client_application_data == 1 {
+                        self.to_client_counter += 1;
+                    }
                     self.relay_to(inbound, outbound).await?;
                 }
             }
@@ -675,7 +680,7 @@ impl<'a> RestlsState<'a> {
                     self.relay_to(inbound, outbound).await?;
                 }
                 ret = self.read_from_stream(inbound, false) => {
-                    ret?;
+                    ret.context("try_read_tls12_till_client_application_data inbound: ")?;
                     self.handle_tls12_inbound(inbound, &mut flow)?;
                     if flow.is_client_0x17() {
                         break;
@@ -781,7 +786,7 @@ impl<'a> RestlsState<'a> {
                     {
                         // this will probably be a close notify.
                         // we'll ignore it.
-                        debug!("[{}]maybe close notify {:?}", self.id, e);
+                        debug!("[{}]maybe close notify {}", self.id, e);
                         Ok(WriteToServerResult::MaybeCloseNotify)
                     } else {
                         Err(e)
@@ -938,7 +943,7 @@ impl<'a> RestlsState<'a> {
             if !outbound_handshake_closed && self.to_client_counter + self.to_server_counter > 5 {
                 outbound_handshake_closed = true;
                 match outbound_handshake.get_mut().shutdown().await {
-                    Err(e) => debug!("[{}]outbound_handshake shutdown got {:?}", self.id, e),
+                    Err(e) => debug!("[{}]outbound_handshake shutdown got {}", self.id, e),
                     Ok(_) => (),
                 }
             }
@@ -1014,7 +1019,7 @@ pub async fn handle(options: Arc<Opt>, inbound: TcpStream, id: usize) -> Result<
             }
         }
         Err(e) => {
-            tracing::error!("handshake failed: {}", e);
+            tracing::error!("handshake failed: {:#}", e);
             copy_bidirectional_fallback(inbound, outbound).await?;
         }
     }

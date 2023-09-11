@@ -181,27 +181,34 @@ impl Decoder for TLSCodec {
     }
 }
 
-pub(crate) fn read_length_padded_header<const N: usize, T: Buf>(buf: &mut T) -> usize {
+pub(crate) fn read_length_padded_header<const N: usize, T: Buf>(buf: &mut T) -> Result<usize> {
     let mut len = 0;
     let mut tmp = [0; 8];
+    if buf.remaining() < N {
+        return Err(anyhow!(
+            "read_length_padded_header failed: expect {}, actual {}",
+            N,
+            buf.remaining()
+        ));
+    }
     buf.copy_to_slice(&mut tmp[..N]);
     for i in 0..N {
         len = (len << 8) | (tmp[i] as usize);
     }
-    len
+    Ok(len)
 }
 
-pub(crate) fn skip_length_padded<const N: usize, T: Buf>(buf: &mut T) -> usize {
-    let len = read_length_padded_header::<N, T>(buf);
-    buf.advance(len);
-    len
+pub(crate) fn skip_length_padded<const N: usize, T: Buf>(buf: &mut T) -> Result<usize> {
+    let len = read_length_padded_header::<N, T>(buf)?;
+    buf.checked_advance(len, "skip_length_padded failed")?;
+    Ok(len)
 }
 
 pub(crate) fn read_length_padded<const N: usize, T: Buf>(
     buf: &mut T,
     copy_to: &mut [u8],
 ) -> Result<usize> {
-    let len = read_length_padded_header::<N, T>(buf);
+    let len = read_length_padded_header::<N, T>(buf)?;
     if copy_to.len() < len {
         return Err(anyhow!("truncated length padded content"));
     }
@@ -212,28 +219,49 @@ pub(crate) fn read_length_padded<const N: usize, T: Buf>(
 pub(crate) fn extend_from_length_prefixed<const N: usize, T: Buf>(
     buf: &mut T,
     copy_to: &mut Vec<u8>,
-) {
-    let len = read_length_padded_header::<N, T>(buf);
-
+) -> Result<()> {
+    let len = read_length_padded_header::<N, T>(buf)?;
+    if len > buf.remaining() {
+        return Err(anyhow!(
+            "extend_from_length_prefixed failed: expect {}, actual {}",
+            len,
+            buf.remaining()
+        ));
+    }
     copy_to.extend_from_slice(&buf.chunk()[..len]);
     buf.advance(len);
+    Ok(())
 }
 
-pub(crate) fn length_prefixed<const N: usize, T: Buf, P: FnOnce(Cursor<&[u8]>)>(
+pub(crate) fn length_prefixed<const N: usize, T: Buf, P: FnOnce(Cursor<&[u8]>) -> Result<()>>(
     buf: &mut T,
     parse: P,
-) {
-    let len = read_length_padded_header::<N, _>(buf);
-    parse(Cursor::new(&buf.chunk()[..len]));
+) -> Result<()> {
+    let len = read_length_padded_header::<N, _>(buf)?;
+    if len > buf.remaining() {
+        return Err(anyhow!(
+            "read length_prefixed bytes failed: expect {}, actual {}",
+            len,
+            buf.remaining()
+        ));
+    }
+    parse(Cursor::new(&buf.chunk()[..len]))?;
     buf.advance(len);
+    Ok(())
 }
 
-pub(crate) fn u8_length_prefixed<T: Buf, P: FnOnce(Cursor<&[u8]>)>(buf: &mut T, parse: P) {
-    length_prefixed::<1, _, _>(buf, parse);
+pub(crate) fn u8_length_prefixed<T: Buf, P: FnOnce(Cursor<&[u8]>) -> Result<()>>(
+    buf: &mut T,
+    parse: P,
+) -> Result<()> {
+    length_prefixed::<1, _, _>(buf, parse)
 }
 
-pub(crate) fn u16_length_prefixed<T: Buf, P: FnOnce(Cursor<&[u8]>)>(buf: &mut T, parse: P) {
-    length_prefixed::<2, _, _>(buf, parse);
+pub(crate) fn u16_length_prefixed<T: Buf, P: FnOnce(Cursor<&[u8]>) -> Result<()>>(
+    buf: &mut T,
+    parse: P,
+) -> Result<()> {
+    length_prefixed::<2, _, _>(buf, parse)
 }
 
 pub(crate) fn xor_bytes(secret: &[u8], msg: &mut [u8]) {
@@ -552,5 +580,23 @@ impl<'a> HandshakeRecord<'a> {
 
     pub fn has_next(&self) -> bool {
         self.hs_msg_cursor < self.record.len()
+    }
+}
+
+pub trait CheckedAdvance {
+    fn checked_advance(&mut self, cnt: usize, err_msg: &str) -> Result<()>;
+}
+
+impl<T: Buf> CheckedAdvance for T {
+    fn checked_advance(&mut self, cnt: usize, err_msg: &str) -> Result<()> {
+        if cnt > self.remaining() {
+            return Err(anyhow!(
+                "{err_msg}, expect {}, actual {}",
+                cnt,
+                self.remaining()
+            ));
+        }
+        self.advance(cnt);
+        Ok(())
     }
 }

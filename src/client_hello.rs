@@ -10,7 +10,7 @@ use crate::{
     },
     utils::{
         extend_from_length_prefixed, read_length_padded, skip_length_padded, u16_length_prefixed,
-        u8_length_prefixed,
+        u8_length_prefixed, CheckedAdvance,
     },
 };
 
@@ -23,51 +23,68 @@ pub(crate) struct ClientHello {
 }
 
 impl ClientHello {
-    fn read_supported_version<T: Buf>(buf: &mut T) -> bool {
+    fn read_supported_version<T: Buf>(buf: &mut T) -> Result<bool> {
         let mut client_supports_tls_13 = false;
         u16_length_prefixed(buf, |mut extension| {
             u8_length_prefixed(&mut extension, |mut versions| {
                 while versions.has_remaining() {
+                    if versions.remaining() < 2 {
+                        return Err(anyhow!(
+                            "read_supported_version failed: versions.remaining() < 2"
+                        ));
+                    }
                     if versions.get_u16().to_be_bytes() == [03, 04] {
                         client_supports_tls_13 = true;
                         break;
                     }
                 }
+                Ok(())
             })
-        });
-        client_supports_tls_13
+        })?;
+        Ok(client_supports_tls_13)
     }
 
-    fn read_psk<T: Buf>(buf: &mut T) -> Vec<u8> {
+    fn read_psk<T: Buf>(buf: &mut T) -> Result<Vec<u8>> {
         let mut psk = Vec::new();
         u16_length_prefixed(buf, |mut extension| {
             u16_length_prefixed(&mut extension, |mut psk_section| {
                 psk.reserve_exact(psk_section.remaining());
                 while psk_section.has_remaining() {
-                    extend_from_length_prefixed::<2, _>(&mut psk_section, &mut psk);
-                    psk_section.advance(4); // +4 to skip psk age
+                    extend_from_length_prefixed::<2, _>(&mut psk_section, &mut psk)?;
+                    psk_section.checked_advance(4, "read_psk failed to skip psk age")?;
+                    // +4 to skip psk age
                 }
-            });
-        });
-        psk
+                Ok(())
+            })
+        })?;
+        Ok(psk)
     }
 
-    fn read_key_share<T: Buf>(buf: &mut T) -> Vec<u8> {
+    fn read_key_share<T: Buf>(buf: &mut T) -> Result<Vec<u8>> {
         let mut key_share = Vec::new();
         u16_length_prefixed(buf, |mut extension| {
             u16_length_prefixed(&mut extension, |mut key_share_section| {
                 key_share.reserve_exact(key_share_section.remaining());
                 while key_share_section.has_remaining() {
+                    if key_share_section.remaining() < 2 {
+                        return Err(anyhow!("read_key_share failed to skip key_share group"));
+                    }
                     key_share.put_u16(key_share_section.get_u16()); // skip key_share group
-                    extend_from_length_prefixed::<2, _>(&mut key_share_section, &mut key_share);
+                    extend_from_length_prefixed::<2, _>(&mut key_share_section, &mut key_share)?;
                 }
-            });
-        });
-        key_share
+                Ok(())
+            })
+        })?;
+        Ok(key_share)
     }
 
     pub(crate) fn parse(buf: &mut Cursor<&[u8]>, id: usize) -> Result<ClientHello> {
-        debug!("[{}]parsing client hello: {}", id, buf.remaining());
+        debug!(
+            "[{}]parsing client hello: {} {:?}",
+            id,
+            buf.remaining(),
+            buf.chunk()
+        );
 
         buf.advance(5); // record header
         let mut _client_random = [0; 32];
@@ -90,8 +107,8 @@ impl ClientHello {
             return Err(anyhow!("reject: session id should be exactly 32 bytes"));
         }
 
-        skip_length_padded::<2, _>(buf); // cipher suites
-        skip_length_padded::<1, _>(buf); // compression methods
+        skip_length_padded::<2, _>(buf)?; // cipher suites
+        skip_length_padded::<1, _>(buf)?; // compression methods
 
         let mut session_ticket = Vec::new();
         let mut client_supports_tls_13 = false;
@@ -102,26 +119,27 @@ impl ClientHello {
                 let ext = ext_section.get_u16();
                 match ext {
                     EXTENSION_SESSION_TICKET => {
-                        extend_from_length_prefixed::<2, _>(&mut ext_section, &mut session_ticket);
+                        extend_from_length_prefixed::<2, _>(&mut ext_section, &mut session_ticket)?;
                         debug!("session_ticket: {:?}", session_ticket);
                     }
                     EXTENSION_SUPPORTED_VERSIONS => {
-                        client_supports_tls_13 = Self::read_supported_version(&mut ext_section);
+                        client_supports_tls_13 = Self::read_supported_version(&mut ext_section)?;
                     }
                     EXTENSION_PRE_SHARED_KEY => {
-                        psk = Self::read_psk(&mut ext_section);
+                        psk = Self::read_psk(&mut ext_section)?;
                         debug!("psk: {:?}", psk);
                     }
                     EXTENSION_KEY_SHARE => {
-                        key_share = Self::read_key_share(&mut ext_section);
+                        key_share = Self::read_key_share(&mut ext_section)?;
                         debug!("client key_share {:?}", key_share);
                     }
                     _ => {
-                        skip_length_padded::<2, _>(&mut ext_section);
+                        skip_length_padded::<2, _>(&mut ext_section)?;
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
 
         if !client_supports_tls_13 {
             return Err(anyhow!("reject: client must support tls 1.3"));
